@@ -302,7 +302,7 @@ static av_cold int ffat_create_decoder(AVCodecContext *avctx, AVPacket *pkt)
     OSStatus status;
     int i;
 
-    enum AVSampleFormat sample_fmt = (avctx->bits_per_raw_sample == 32) ?
+    enum AVSampleFormat sample_fmt = (avctx->bits_per_coded_sample > 16) ?
                                      AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
 
     AudioStreamBasicDescription in_format = {
