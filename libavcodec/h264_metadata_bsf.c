@@ -427,13 +427,7 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *pkt)
     if (ctx->delete_filler) {
         for (i = au->nb_units - 1; i >= 0; i--) {
             if (au->units[i].type == H264_NAL_FILLER_DATA) {
-                // Filler NAL units.
-                err = ff_cbs_delete_unit(ctx->cbc, au, i);
-                if (err < 0) {
-                    av_log(bsf, AV_LOG_ERROR, "Failed to delete "
-                           "filler NAL.\n");
-                    goto fail;
-                }
+                ff_cbs_delete_unit(ctx->cbc, au, i);
                 continue;
             }
 
@@ -443,15 +437,9 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *pkt)
 
                 for (j = sei->payload_count - 1; j >= 0; j--) {
                     if (sei->payload[j].payload_type ==
-                        H264_SEI_TYPE_FILLER_PAYLOAD) {
-                        err = ff_cbs_h264_delete_sei_message(ctx->cbc, au,
-                                                             &au->units[i], j);
-                        if (err < 0) {
-                            av_log(bsf, AV_LOG_ERROR, "Failed to delete "
-                                   "filler SEI message.\n");
-                            goto fail;
-                        }
-                    }
+                        H264_SEI_TYPE_FILLER_PAYLOAD)
+                        ff_cbs_h264_delete_sei_message(ctx->cbc, au,
+                                                       &au->units[i], j);
                 }
             }
         }
@@ -475,13 +463,8 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *pkt)
 
                 if (ctx->display_orientation == REMOVE ||
                     ctx->display_orientation == INSERT) {
-                    err = ff_cbs_h264_delete_sei_message(ctx->cbc, au,
-                                                         &au->units[i], j);
-                    if (err < 0) {
-                        av_log(bsf, AV_LOG_ERROR, "Failed to delete "
-                               "display orientation SEI message.\n");
-                        goto fail;
-                    }
+                    ff_cbs_h264_delete_sei_message(ctx->cbc, au,
+                                                   &au->units[i], j);
                     continue;
                 }
 
