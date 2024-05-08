@@ -24,7 +24,6 @@
 
 #include "config.h"
 
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +39,7 @@
 #include <fcntl.h>
 
 #include "libavcodec/avcodec.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/hash.h"
 #include "libavutil/bswap.h"

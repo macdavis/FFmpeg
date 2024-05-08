@@ -20,6 +20,7 @@
  */
 #include "movenccenc.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avio_internal.h"
 #include "movenc.h"
 #include "avc.h"
@@ -412,4 +413,6 @@ int ff_mov_cenc_init(MOVMuxCencContext* ctx, uint8_t* encryption_key,
 void ff_mov_cenc_free(MOVMuxCencContext* ctx)
 {
     av_aes_ctr_free(ctx->aes_ctr);
+    av_freep(&ctx->auxiliary_info);
+    av_freep(&ctx->auxiliary_info_sizes);
 }

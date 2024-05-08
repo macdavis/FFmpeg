@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "libavutil/mem.h"
 #include "adts_header.h"
 #include "adts_parser.h"
 
@@ -37,6 +38,43 @@ int av_adts_header_parse(const uint8_t *buf, uint32_t *samples, uint8_t *frames)
         return err;
     *samples = hdr.samples;
     *frames  = hdr.num_aac_frames;
+    return 0;
+#else
+    return AVERROR(ENOSYS);
+#endif
+}
+
+int avpriv_adts_header_parse(AACADTSHeaderInfo **phdr, const uint8_t *buf, size_t size)
+{
+#if CONFIG_ADTS_HEADER
+    int ret = 0;
+    int allocated = 0;
+    GetBitContext gb;
+
+    if (!phdr || !buf || size < AV_AAC_ADTS_HEADER_SIZE)
+        return AVERROR_INVALIDDATA;
+
+    if (!*phdr) {
+        allocated = 1;
+        *phdr = av_mallocz(sizeof(AACADTSHeaderInfo));
+    }
+    if (!*phdr)
+        return AVERROR(ENOMEM);
+
+    ret = init_get_bits8(&gb, buf, AV_AAC_ADTS_HEADER_SIZE);
+    if (ret < 0) {
+        if (allocated)
+            av_freep(phdr);
+        return ret;
+    }
+
+    ret = ff_adts_header_parse(&gb, *phdr);
+    if (ret < 0) {
+        if (allocated)
+            av_freep(phdr);
+        return ret;
+    }
+
     return 0;
 #else
     return AVERROR(ENOSYS);

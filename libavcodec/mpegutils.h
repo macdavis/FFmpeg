@@ -26,23 +26,11 @@
 #include "libavutil/frame.h"
 
 #include "avcodec.h"
-#include "version.h"
-
-/**
- * Return value for header parsers if frame is not coded.
- * */
-#define FRAME_SKIPPED 100
 
 /* picture type */
 #define PICT_TOP_FIELD     1
 #define PICT_BOTTOM_FIELD  2
 #define PICT_FRAME         3
-
-/**
- * Value of Picture.reference when Picture is not a reference picture, but
- * is held for delayed output.
- */
-#define DELAYED_PIC_REF 4
 
 #define MAX_MB_BYTES    (30 * 16 * 16 * 3 / 8 + 120)
 #define MAX_FCODE        7
@@ -100,49 +88,21 @@
 
 #define HAS_CBP(a)       ((a) & MB_TYPE_CBP)
 
-/* MB types for encoding */
-#define CANDIDATE_MB_TYPE_INTRA      (1 <<  0)
-#define CANDIDATE_MB_TYPE_INTER      (1 <<  1)
-#define CANDIDATE_MB_TYPE_INTER4V    (1 <<  2)
-#define CANDIDATE_MB_TYPE_SKIPPED    (1 <<  3)
-
-#define CANDIDATE_MB_TYPE_DIRECT     (1 <<  4)
-#define CANDIDATE_MB_TYPE_FORWARD    (1 <<  5)
-#define CANDIDATE_MB_TYPE_BACKWARD   (1 <<  6)
-#define CANDIDATE_MB_TYPE_BIDIR      (1 <<  7)
-
-#define CANDIDATE_MB_TYPE_INTER_I    (1 <<  8)
-#define CANDIDATE_MB_TYPE_FORWARD_I  (1 <<  9)
-#define CANDIDATE_MB_TYPE_BACKWARD_I (1 << 10)
-#define CANDIDATE_MB_TYPE_BIDIR_I    (1 << 11)
-
-#define CANDIDATE_MB_TYPE_DIRECT0    (1 << 12)
-
-#define INPLACE_OFFSET 16
-
-enum OutputFormat {
-    FMT_MPEG1,
-    FMT_H261,
-    FMT_H263,
-    FMT_MJPEG,
-};
-
-
 /**
  * Draw a horizontal band if supported.
  *
  * @param h is the normal height, this will be reduced automatically if needed
  */
-void ff_draw_horiz_band(AVCodecContext *avctx, AVFrame *cur, AVFrame *last,
+void ff_draw_horiz_band(AVCodecContext *avctx, const AVFrame *cur, const AVFrame *last,
                         int y, int h, int picture_structure, int first_field,
                         int low_delay);
 
 /**
  * Print debugging info for the given picture.
  */
-void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_table,
-                         uint32_t *mbtype_table, int8_t *qscale_table, int16_t (*motion_val[2])[2],
-                         int *low_delay,
-                         int mb_width, int mb_height, int mb_stride, int quarter_sample);
+void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict,
+                          const uint8_t *mbskip_table, const uint32_t *mbtype_table,
+                          const int8_t *qscale_table, int16_t (*const motion_val[2])[2],
+                          int mb_width, int mb_height, int mb_stride, int quarter_sample);
 
 #endif /* AVCODEC_MPEGUTILS_H */

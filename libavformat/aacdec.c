@@ -24,6 +24,7 @@
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "id3v1.h"
 #include "id3v2.h"
@@ -80,18 +81,41 @@ static int adts_aac_probe(const AVProbeData *p)
         return 0;
 }
 
+static int adts_aac_resync(AVFormatContext *s)
+{
+    uint16_t state;
+    int64_t start_pos = avio_tell(s->pb);
+
+    // skip data until an ADTS frame is found
+    state = avio_r8(s->pb);
+    while (!avio_feof(s->pb) &&
+           (avio_tell(s->pb) - start_pos) < s->probesize) {
+        state = (state << 8) | avio_r8(s->pb);
+        if ((state >> 4) != 0xFFF)
+            continue;
+        avio_seek(s->pb, -2, SEEK_CUR);
+        break;
+    }
+    if (s->pb->eof_reached)
+        return AVERROR_EOF;
+    if ((state >> 4) != 0xFFF)
+        return AVERROR_INVALIDDATA;
+
+    return 0;
+}
+
 static int adts_aac_read_header(AVFormatContext *s)
 {
     AVStream *st;
-    uint16_t state;
+    int ret;
 
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
 
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codecpar->codec_id   = s->iformat->raw_codec_id;
-    st->need_parsing         = AVSTREAM_PARSE_FULL_RAW;
+    st->codecpar->codec_id   = AV_CODEC_ID_AAC;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
 
     ff_id3v1_read(s);
     if ((s->pb->seekable & AVIO_SEEKABLE_NORMAL) &&
@@ -101,17 +125,9 @@ static int adts_aac_read_header(AVFormatContext *s)
         avio_seek(s->pb, cur, SEEK_SET);
     }
 
-    // skip data until the first ADTS frame is found
-    state = avio_r8(s->pb);
-    while (!avio_feof(s->pb) && avio_tell(s->pb) < s->probesize) {
-        state = (state << 8) | avio_r8(s->pb);
-        if ((state >> 4) != 0xFFF)
-            continue;
-        avio_seek(s->pb, -2, SEEK_CUR);
-        break;
-    }
-    if ((state >> 4) != 0xFFF)
-        return AVERROR_INVALIDDATA;
+    ret = adts_aac_resync(s);
+    if (ret < 0)
+        return ret;
 
     // LCM of all possible ADTS sample rates
     avpriv_set_pts_info(st, 64, 1, 28224000);
@@ -122,19 +138,18 @@ static int adts_aac_read_header(AVFormatContext *s)
 static int handle_id3(AVFormatContext *s, AVPacket *pkt)
 {
     AVDictionary *metadata = NULL;
-    AVIOContext ioctx;
-    ID3v2ExtraMeta *id3v2_extra_meta = NULL;
+    FFIOContext pb;
+    ID3v2ExtraMeta *id3v2_extra_meta;
     int ret;
 
     ret = av_append_packet(s->pb, pkt, ff_id3v2_tag_len(pkt->data) - pkt->size);
     if (ret < 0) {
-        av_packet_unref(pkt);
         return ret;
     }
 
-    ffio_init_context(&ioctx, pkt->data, pkt->size, 0, NULL, NULL, NULL, NULL);
-    ff_id3v2_read_dict(&ioctx, &metadata, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta);
-    if ((ret = ff_id3v2_parse_priv_dict(&metadata, &id3v2_extra_meta)) < 0)
+    ffio_init_read_context(&pb, pkt->data, pkt->size);
+    ff_id3v2_read_dict(&pb.pub, &metadata, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta);
+    if ((ret = ff_id3v2_parse_priv_dict(&metadata, id3v2_extra_meta)) < 0)
         goto error;
 
     if (metadata) {
@@ -161,7 +176,6 @@ retry:
         return ret;
 
     if (ret < ADTS_HEADER_SIZE) {
-        av_packet_unref(pkt);
         return AVERROR(EIO);
     }
 
@@ -172,14 +186,13 @@ retry:
         av_assert2(append > 0);
         ret = av_append_packet(s->pb, pkt, append);
         if (ret != append) {
-            av_packet_unref(pkt);
             return AVERROR(EIO);
         }
         if (!ff_id3v2_match(pkt->data, ID3v2_DEFAULT_MAGIC)) {
             av_packet_unref(pkt);
-            return AVERROR_INVALIDDATA;
-        }
-        ret = handle_id3(s, pkt);
+            ret = adts_aac_resync(s);
+        } else
+            ret = handle_id3(s, pkt);
         if (ret < 0)
             return ret;
 
@@ -188,25 +201,22 @@ retry:
 
     fsize = (AV_RB32(pkt->data + 3) >> 13) & 0x1FFF;
     if (fsize < ADTS_HEADER_SIZE) {
-        av_packet_unref(pkt);
         return AVERROR_INVALIDDATA;
     }
 
     ret = av_append_packet(s->pb, pkt, fsize - pkt->size);
-    if (ret < 0)
-        av_packet_unref(pkt);
 
     return ret;
 }
 
-AVInputFormat ff_aac_demuxer = {
-    .name         = "aac",
-    .long_name    = NULL_IF_CONFIG_SMALL("raw ADTS AAC (Advanced Audio Coding)"),
+const FFInputFormat ff_aac_demuxer = {
+    .p.name       = "aac",
+    .p.long_name  = NULL_IF_CONFIG_SMALL("raw ADTS AAC (Advanced Audio Coding)"),
+    .p.flags      = AVFMT_GENERIC_INDEX,
+    .p.extensions = "aac",
+    .p.mime_type  = "audio/aac,audio/aacp,audio/x-aac",
     .read_probe   = adts_aac_probe,
     .read_header  = adts_aac_read_header,
     .read_packet  = adts_aac_read_packet,
-    .flags        = AVFMT_GENERIC_INDEX,
-    .extensions   = "aac",
-    .mime_type    = "audio/aac,audio/aacp,audio/x-aac",
     .raw_codec_id = AV_CODEC_ID_AAC,
 };

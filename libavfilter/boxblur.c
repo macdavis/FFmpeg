@@ -20,6 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "boxblur.h"
 
 static const char *const var_names[] = {
@@ -91,7 +92,7 @@ int ff_boxblur_eval_filter_params(AVFilterLink *inlink,
                                  NULL, NULL, NULL, NULL, NULL, 0, ctx); \
     comp->radius = res;                                                 \
     if (ret < 0) {                                                      \
-        av_log(NULL, AV_LOG_ERROR,                                      \
+        av_log(ctx, AV_LOG_ERROR,                                      \
                "Error when evaluating " #comp " radius expression '%s'\n", expr); \
         return ret;                                                     \
     }

@@ -22,16 +22,13 @@
 
 SECTION_RODATA
 
-         ; 0.85..^1    0.85..^2    0.85..^3    0.85..^4
-tab_st: dd 0x3f599a00, 0x3f38f671, 0x3f1d382a, 0x3f05a32f
-
 SECTION .text
 
 INIT_XMM fma3
 %if UNIX64
-cglobal opus_deemphasis, 3, 3, 8, out, in, len
+cglobal opus_deemphasis, 4, 4, 8, out, in, weights, len
 %else
-cglobal opus_deemphasis, 4, 4, 8, out, in, coeff, len
+cglobal opus_deemphasis, 5, 5, 8, out, in, coeff, weights, len
 %endif
 %if ARCH_X86_32
     VBROADCASTSS m0, coeffm
@@ -41,7 +38,7 @@ cglobal opus_deemphasis, 4, 4, 8, out, in, coeff, len
     shufps m0, m0, 0
 %endif
 
-    movaps m4, [tab_st]
+    movaps m4, [weightsq]
     VBROADCASTSS m5, m4
     shufps m6, m4, m4, q1111
     shufps m7, m4, m4, q2222
@@ -64,7 +61,7 @@ cglobal opus_deemphasis, 4, 4, 8, out, in, coeff, len
 
     add inq,  mmsize
     add outq, mmsize
-    sub lenq, mmsize >> 2
+    sub lend, mmsize >> 2
     jg .loop
 
 %if ARCH_X86_64 == 0
@@ -80,7 +77,8 @@ cglobal opus_postfilter, 4, 4, 8, data, period, gains, len
     VBROADCASTSS m1, [gainsq + 4]
     VBROADCASTSS m2, [gainsq + 8]
 
-    lea periodq, [periodq*4 + 8]
+    shl periodd, 2
+    add periodq, 8
     neg periodq
 
     movups  m3, [dataq + periodq]
@@ -104,7 +102,7 @@ cglobal opus_postfilter, 4, 4, 8, data, period, gains, len
     movaps  [dataq], m5
 
     add dataq, mmsize
-    sub lenq,  mmsize >> 2
+    sub lend,  mmsize >> 2
     jg .loop
 
     RET

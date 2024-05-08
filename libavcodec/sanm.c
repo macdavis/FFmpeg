@@ -21,13 +21,13 @@
  */
 
 #include "libavutil/avassert.h"
-#include "libavutil/bswap.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
 #include "copy_block.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 #define NGLYPHS 256
 #define GLYPH_COORD_VECT_SIZE 16
@@ -491,6 +491,11 @@ static av_cold int decode_init(AVCodecContext *avctx)
 
     ctx->avctx   = avctx;
     ctx->version = !avctx->extradata_size;
+    // early sanity check before allocations to avoid need for deallocation code.
+    if (!ctx->version && avctx->extradata_size < 1026) {
+        av_log(avctx, AV_LOG_ERROR, "Not enough extradata.\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     avctx->pix_fmt = ctx->version ? AV_PIX_FMT_RGB565 : AV_PIX_FMT_PAL8;
 
@@ -505,11 +510,6 @@ static av_cold int decode_init(AVCodecContext *avctx)
 
     if (!ctx->version) {
         int i;
-
-        if (avctx->extradata_size < 1026) {
-            av_log(avctx, AV_LOG_ERROR, "Not enough extradata.\n");
-            return AVERROR_INVALIDDATA;
-        }
 
         ctx->subversion = AV_RL16(avctx->extradata);
         for (i = 0; i < PALETTE_SIZE; i++)
@@ -1386,13 +1386,13 @@ static int copy_output(SANMVideoContext *ctx, SANMFrameHeader *hdr)
     return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data,
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
                         int *got_frame_ptr, AVPacket *pkt)
 {
     SANMVideoContext *ctx = avctx->priv_data;
     int i, ret;
 
-    ctx->frame = data;
+    ctx->frame = frame;
     bytestream2_init(&ctx->gb, pkt->data, pkt->size);
 
     if (!ctx->version) {
@@ -1485,11 +1485,13 @@ static int decode_frame(AVCodecContext *avctx, void *data,
             return ret;
 
         ctx->rotate_code = header.rotate_code;
-        if ((ctx->frame->key_frame = !header.seq_num)) {
+        if (!header.seq_num) {
+            ctx->frame->flags |= AV_FRAME_FLAG_KEY;
             ctx->frame->pict_type = AV_PICTURE_TYPE_I;
             fill_frame(ctx->frm1, ctx->npixels, header.bg_color);
             fill_frame(ctx->frm2, ctx->npixels, header.bg_color);
         } else {
+            ctx->frame->flags &= ~AV_FRAME_FLAG_KEY;
             ctx->frame->pict_type = AV_PICTURE_TYPE_P;
         }
 
@@ -1515,14 +1517,14 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     return pkt->size;
 }
 
-AVCodec ff_sanm_decoder = {
-    .name           = "sanm",
-    .long_name      = NULL_IF_CONFIG_SMALL("LucasArts SANM/Smush video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SANM,
+const FFCodec ff_sanm_decoder = {
+    .p.name         = "sanm",
+    CODEC_LONG_NAME("LucasArts SANM/Smush video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SANM,
     .priv_data_size = sizeof(SANMVideoContext),
     .init           = decode_init,
     .close          = decode_end,
-    .decode         = decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };
