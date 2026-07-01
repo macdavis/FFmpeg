@@ -27,6 +27,7 @@
 
 #include <inttypes.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 #include "avformat.h"
@@ -198,6 +199,10 @@ static int process_audio_header_elements(AVFormatContext *s)
             av_log(s, AV_LOG_DEBUG, "end of header block reached\n");
             in_header = 0;
             break;
+        case 0x1B:
+            ea->video.time_base = (AVRational) {1, read_arbitrary(pb)};
+            av_log(s, AV_LOG_DEBUG, "Setting framerate to %u\n", ea->video.time_base.den);
+            break;
         default:
             av_log(s, AV_LOG_DEBUG,
                    "header element 0x%02x set to 0x%08"PRIx32"\n",
@@ -325,7 +330,8 @@ static void process_video_header_mdec(AVFormatContext *s, VideoProperties *video
     avio_skip(pb, 4);
     video->width       = avio_rl16(pb);
     video->height      = avio_rl16(pb);
-    video->time_base   = (AVRational) { 1, 15 };
+    if (!video->time_base.num)
+        video->time_base   = (AVRational) { 1, 15 };
     video->codec = AV_CODEC_ID_MDEC;
 }
 
@@ -427,12 +433,14 @@ static int process_ea_header(AVFormatContext *s)
         case pQGT_TAG:
         case TGQs_TAG:
             ea->video.codec = AV_CODEC_ID_TGQ;
-            ea->video.time_base   = (AVRational) { 1, 15 };
+            if (!ea->video.time_base.num)
+                ea->video.time_base   = (AVRational) { 1, 15 };
             break;
 
         case pIQT_TAG:
             ea->video.codec = AV_CODEC_ID_TQI;
-            ea->video.time_base   = (AVRational) { 1, 15 };
+            if (!ea->video.time_base.num)
+                ea->video.time_base   = (AVRational) { 1, 15 };
             break;
 
         case MADk_TAG:
@@ -530,7 +538,7 @@ static int ea_read_header(AVFormatContext *s)
     AVStream *st;
 
     if (process_ea_header(s)<=0)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     if (init_video_stream(s, &ea->video) || init_video_stream(s, &ea->alpha))
         return AVERROR(ENOMEM);
@@ -607,6 +615,7 @@ static int ea_read_packet(AVFormatContext *s, AVPacket *pkt)
                 return AVERROR_INVALIDDATA;
             avio_skip(pb, 32);
             chunk_size -= 32;
+            av_fallthrough;
         case ISNd_TAG:
         case SCDl_TAG:
         case SNDC_TAG:
@@ -702,6 +711,7 @@ static int ea_read_packet(AVFormatContext *s, AVPacket *pkt)
         case TGQs_TAG:
         case MADk_TAG:
             key = AV_PKT_FLAG_KEY;
+            av_fallthrough;
         case MVIf_TAG:
         case fVGT_TAG:
         case MADm_TAG:
@@ -725,6 +735,7 @@ static int ea_read_packet(AVFormatContext *s, AVPacket *pkt)
         case MPCh_TAG:
         case pIQT_TAG:
             key = AV_PKT_FLAG_KEY;
+            av_fallthrough;
         case MV0F_TAG:
         case AV0F_TAG:
 get_video_packet:

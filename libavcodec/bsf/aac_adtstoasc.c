@@ -19,14 +19,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "adts_header.h"
-#include "adts_parser.h"
-#include "bsf.h"
-#include "bsf_internal.h"
-#include "put_bits.h"
-#include "get_bits.h"
-#include "mpeg4audio.h"
-#include "mpeg4audio_copy_pce.h"
+#include "libavcodec/adts_header.h"
+#include "libavcodec/adts_parser.h"
+#include "libavcodec/bsf.h"
+#include "libavcodec/bsf_internal.h"
+#include "libavcodec/put_bits.h"
+#include "libavcodec/get_bits.h"
+#include "libavcodec/mpeg4audio.h"
+#include "libavcodec/mpeg4audio_copy_pce.h"
 
 typedef struct AACBSFContext {
     int first_frame_done;
@@ -40,7 +40,6 @@ static int aac_adtstoasc_filter(AVBSFContext *bsfc, AVPacket *pkt)
 {
     AACBSFContext *ctx = bsfc->priv_data;
 
-    GetBitContext gb;
     PutBitContext pb;
     AACADTSHeaderInfo hdr;
     int ret;
@@ -55,9 +54,7 @@ static int aac_adtstoasc_filter(AVBSFContext *bsfc, AVPacket *pkt)
     if (pkt->size < AV_AAC_ADTS_HEADER_SIZE)
         goto packet_too_small;
 
-    init_get_bits(&gb, pkt->data, AV_AAC_ADTS_HEADER_SIZE * 8);
-
-    if (ff_adts_header_parse(&gb, &hdr) < 0) {
+    if (ff_adts_header_parse_buf(pkt->data, &hdr) < 0) {
         av_log(bsfc, AV_LOG_ERROR, "Error parsing ADTS frame header!\n");
         ret = AVERROR_INVALIDDATA;
         goto fail;
@@ -81,6 +78,7 @@ static int aac_adtstoasc_filter(AVBSFContext *bsfc, AVPacket *pkt)
         uint8_t       *extradata;
 
         if (!hdr.chan_config) {
+            GetBitContext gb;
             init_get_bits(&gb, pkt->data, pkt->size * 8);
             if (get_bits(&gb, 3) != 5) {
                 avpriv_report_missing_feature(bsfc,

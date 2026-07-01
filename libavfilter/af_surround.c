@@ -26,7 +26,6 @@
 #include "avfilter.h"
 #include "audio.h"
 #include "filters.h"
-#include "internal.h"
 #include "formats.h"
 #include "window_func.h"
 
@@ -147,17 +146,20 @@ typedef struct AudioSurroundContext {
                       int n);
 } AudioSurroundContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    AudioSurroundContext *s = ctx->priv;
-    AVFilterFormats *formats = NULL;
+    static const enum AVSampleFormat formats[] = {
+        AV_SAMPLE_FMT_FLTP,
+        AV_SAMPLE_FMT_NONE,
+    };
+
+    const AudioSurroundContext *s = ctx->priv;
     AVFilterChannelLayouts *layouts = NULL;
     int ret;
 
-    ret = ff_add_format(&formats, AV_SAMPLE_FMT_FLTP);
-    if (ret)
-        return ret;
-    ret = ff_set_common_formats(ctx, formats);
+    ret = ff_set_sample_formats_from_list2(ctx, cfg_in, cfg_out, formats);
     if (ret)
         return ret;
 
@@ -166,7 +168,7 @@ static int query_formats(AVFilterContext *ctx)
     if (ret)
         return ret;
 
-    ret = ff_channel_layouts_ref(layouts, &ctx->outputs[0]->incfg.channel_layouts);
+    ret = ff_channel_layouts_ref(layouts, &cfg_out[0]->channel_layouts);
     if (ret)
         return ret;
 
@@ -175,11 +177,11 @@ static int query_formats(AVFilterContext *ctx)
     if (ret)
         return ret;
 
-    ret = ff_channel_layouts_ref(layouts, &ctx->inputs[0]->outcfg.channel_layouts);
+    ret = ff_channel_layouts_ref(layouts, &cfg_in[0]->channel_layouts);
     if (ret)
         return ret;
 
-    return ff_set_common_all_samplerates(ctx);
+    return 0;
 }
 
 static void set_input_levels(AVFilterContext *ctx)
@@ -1123,6 +1125,31 @@ static av_cold int init(AVFilterContext *ctx)
     s->create_lfe = av_channel_layout_index_from_channel(&s->out_ch_layout,
                                                          AV_CHAN_LOW_FREQUENCY) >= 0;
 
+    switch (out_channel_layout) {
+    case AV_CH_LAYOUT_MONO:
+    case AV_CH_LAYOUT_STEREO:
+    case AV_CH_LAYOUT_2POINT1:
+    case AV_CH_LAYOUT_2_1:
+    case AV_CH_LAYOUT_2_2:
+    case AV_CH_LAYOUT_SURROUND:
+    case AV_CH_LAYOUT_3POINT1:
+    case AV_CH_LAYOUT_QUAD:
+    case AV_CH_LAYOUT_4POINT0:
+    case AV_CH_LAYOUT_4POINT1:
+    case AV_CH_LAYOUT_5POINT0:
+    case AV_CH_LAYOUT_5POINT1:
+    case AV_CH_LAYOUT_5POINT0_BACK:
+    case AV_CH_LAYOUT_5POINT1_BACK:
+    case AV_CH_LAYOUT_6POINT0:
+    case AV_CH_LAYOUT_6POINT1:
+    case AV_CH_LAYOUT_7POINT0:
+    case AV_CH_LAYOUT_7POINT1:
+    case AV_CH_LAYOUT_OCTAGONAL:
+        break;
+    default:
+        goto fail;
+    }
+
     switch (in_channel_layout) {
     case AV_CH_LAYOUT_STEREO:
         s->filter = filter_stereo;
@@ -1234,8 +1261,8 @@ static int fft_channel(AVFilterContext *ctx, AVFrame *in, int ch)
 static int fft_channels(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     AVFrame *in = arg;
-    const int start = (in->ch_layout.nb_channels * jobnr) / nb_jobs;
-    const int end = (in->ch_layout.nb_channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(in->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(in->ch_layout.nb_channels, jobnr + 1, nb_jobs);
 
     for (int ch = start; ch < end; ch++)
         fft_channel(ctx, in, ch);
@@ -1275,8 +1302,8 @@ static int ifft_channels(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs
 {
     AudioSurroundContext *s = ctx->priv;
     AVFrame *out = arg;
-    const int start = (out->ch_layout.nb_channels * jobnr) / nb_jobs;
-    const int end = (out->ch_layout.nb_channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(out->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(out->ch_layout.nb_channels, jobnr + 1, nb_jobs);
 
     for (int ch = start; ch < end; ch++) {
         if (s->upmix)
@@ -1483,17 +1510,17 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_af_surround = {
-    .name           = "surround",
-    .description    = NULL_IF_CONFIG_SMALL("Apply audio surround upmix filter."),
+const FFFilter ff_af_surround = {
+    .p.name         = "surround",
+    .p.description  = NULL_IF_CONFIG_SMALL("Apply audio surround upmix filter."),
+    .p.priv_class   = &surround_class,
+    .p.flags        = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size      = sizeof(AudioSurroundContext),
-    .priv_class     = &surround_class,
     .init           = init,
     .uninit         = uninit,
     .activate       = activate,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
-    FILTER_QUERY_FUNC(query_formats),
-    .flags          = AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
 };

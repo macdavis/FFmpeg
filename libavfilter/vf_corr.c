@@ -27,8 +27,8 @@
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "drawutils.h"
+#include "filters.h"
 #include "framesync.h"
-#include "internal.h"
 
 typedef struct Sums {
     uint64_t s[2];
@@ -101,8 +101,8 @@ static int sum_##name(AVFilterContext *ctx, void *arg,       \
                                     sizeof(type);            \
         const int h = s->planeheight[c];                     \
         const int w = s->planewidth[c];                      \
-        const int slice_start = (h * jobnr) / nb_jobs;       \
-        const int slice_end = (h * (jobnr+1)) / nb_jobs;     \
+        const int slice_start = ff_slice_pos(h, jobnr, nb_jobs); \
+        const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs); \
         const type *src1 = (const type *)master->data[c] +   \
                             linesize1 * slice_start;         \
         const type *src2 = (const type *)ref->data[c] +      \
@@ -147,8 +147,8 @@ static int corr_##name(AVFilterContext *ctx, void *arg,      \
         const type *src2 = (const type *)ref->data[c];       \
         const int h = s->planeheight[c];                     \
         const int w = s->planewidth[c];                      \
-        const int slice_start = (h * jobnr) / nb_jobs;       \
-        const int slice_end = (h * (jobnr+1)) / nb_jobs;     \
+        const int slice_start = ff_slice_pos(h, jobnr, nb_jobs); \
+        const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs); \
         const float scale = 1.f / s->max[c];                 \
         const float mean1 = s->mean[c][0];                   \
         const float mean2 = s->mean[c][1];                   \
@@ -330,9 +330,11 @@ static int config_input_ref(AVFilterLink *inlink)
 
 static int config_output(AVFilterLink *outlink)
 {
+    FilterLink *outl = ff_filter_link(outlink);
     AVFilterContext *ctx = outlink->src;
     CorrContext *s = ctx->priv;
     AVFilterLink *mainlink = ctx->inputs[0];
+    FilterLink *ml = ff_filter_link(mainlink);
     int ret;
 
     ret = ff_framesync_init_dualinput(&s->fs, ctx);
@@ -342,7 +344,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->h = mainlink->h;
     outlink->time_base = mainlink->time_base;
     outlink->sample_aspect_ratio = mainlink->sample_aspect_ratio;
-    outlink->frame_rate = mainlink->frame_rate;
+    outl->frame_rate = ml->frame_rate;
     if ((ret = ff_framesync_configure(&s->fs)) < 0)
         return ret;
 
@@ -415,19 +417,19 @@ static const AVOption options[] = {
 #define corr_options options
 FRAMESYNC_DEFINE_CLASS(corr, CorrContext, fs);
 
-const AVFilter ff_vf_corr = {
-    .name          = "corr",
-    .description   = NULL_IF_CONFIG_SMALL("Calculate the correlation between two video streams."),
+const FFFilter ff_vf_corr = {
+    .p.name        = "corr",
+    .p.description = NULL_IF_CONFIG_SMALL("Calculate the correlation between two video streams."),
+    .p.priv_class  = &corr_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS             |
+                     AVFILTER_FLAG_METADATA_ONLY,
     .preinit       = corr_framesync_preinit,
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
     .priv_size     = sizeof(CorrContext),
-    .priv_class    = &corr_class,
     FILTER_INPUTS(corr_inputs),
     FILTER_OUTPUTS(corr_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS             |
-                     AVFILTER_FLAG_METADATA_ONLY,
 };

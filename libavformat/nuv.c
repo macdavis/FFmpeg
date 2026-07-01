@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
@@ -165,7 +166,9 @@ static int nuv_header(AVFormatContext *s)
     int is_mythtv, width, height, v_packs, a_packs, ret;
     AVStream *vst = NULL, *ast = NULL;
 
-    avio_read(pb, id_string, 12);
+    if ((ret = ffio_read_size(pb, id_string, 12)) < 0)
+        return ret;
+
     is_mythtv = !memcmp(id_string, "MythTVVideo", 12);
     avio_skip(pb, 5);       // version string
     avio_skip(pb, 3);       // padding
@@ -318,7 +321,7 @@ static int nuv_packet(AVFormatContext *s, AVPacket *pkt)
         }
     }
 
-    return AVERROR(EIO);
+    return AVERROR_INVALIDDATA;
 }
 
 /**
@@ -387,6 +390,7 @@ static int64_t nuv_read_dts(AVFormatContext *s, int stream_index,
                     *ppos = pos;
                     return dts;
                 }
+                av_fallthrough;
             default:
                 avio_skip(pb, size);
                 break;

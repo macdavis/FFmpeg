@@ -22,6 +22,7 @@
 
 #include <inttypes.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 
@@ -63,6 +64,7 @@ static void do_vflip(AVCodecContext *avctx, AVFrame *pic, int vflip)
         pic->linesize[1] = -pic->linesize[1];
         pic->data[2] += (avctx->height - 1) * pic->linesize[2];
         pic->linesize[2] = -pic->linesize[2];
+        av_fallthrough;
     case AV_PIX_FMT_RGB555LE:
     case AV_PIX_FMT_RGB565LE:
     case AV_PIX_FMT_BGR24:
@@ -863,8 +865,6 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *pic,
     if (ret)
         return ret;
 
-    pic->pict_type = AV_PICTURE_TYPE_I;
-    pic->flags |= AV_FRAME_FLAG_KEY;
     *got_frame = 1;
 
     return avpkt->size;

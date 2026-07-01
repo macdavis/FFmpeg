@@ -26,219 +26,42 @@
 #include "config_components.h"
 
 #include "libavutil/ambient_viewing_environment.h"
+#include "libavutil/buffer.h"
 #include "libavutil/display.h"
-#include "libavutil/hdr_dynamic_metadata.h"
 #include "libavutil/film_grain_params.h"
 #include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mem.h"
+#include "libavutil/refstruct.h"
 #include "libavutil/stereo3d.h"
 
 #include "atsc_a53.h"
 #include "avcodec.h"
 #include "decode.h"
-#include "dynamic_hdr_vivid.h"
 #include "get_bits.h"
 #include "golomb.h"
 #include "h2645_sei.h"
 #include "itut35.h"
 
-#define IS_H264(codec_id) (CONFIG_H264_SEI && CONFIG_HEVC_SEI ? codec_id == AV_CODEC_ID_H264 : CONFIG_H264_SEI)
-#define IS_HEVC(codec_id) (CONFIG_H264_SEI && CONFIG_HEVC_SEI ? codec_id == AV_CODEC_ID_HEVC : CONFIG_HEVC_SEI)
-
-#if CONFIG_HEVC_SEI
-static int decode_registered_user_data_dynamic_hdr_plus(HEVCSEIDynamicHDRPlus *s,
-                                                        GetByteContext *gb)
-{
-    size_t meta_size;
-    int err;
-    AVDynamicHDRPlus *metadata = av_dynamic_hdr_plus_alloc(&meta_size);
-    if (!metadata)
-        return AVERROR(ENOMEM);
-
-    err = av_dynamic_hdr_plus_from_t35(metadata, gb->buffer,
-                                       bytestream2_get_bytes_left(gb));
-    if (err < 0) {
-        av_free(metadata);
-        return err;
-    }
-
-    av_buffer_unref(&s->info);
-    s->info = av_buffer_create((uint8_t *)metadata, meta_size, NULL, NULL, 0);
-    if (!s->info) {
-        av_free(metadata);
-        return AVERROR(ENOMEM);
-    }
-
-    return 0;
-}
-
-static int decode_registered_user_data_dynamic_hdr_vivid(HEVCSEIDynamicHDRVivid *s,
-                                                         GetByteContext *gb)
-{
-    size_t meta_size;
-    int err;
-    AVDynamicHDRVivid *metadata = av_dynamic_hdr_vivid_alloc(&meta_size);
-    if (!metadata)
-        return AVERROR(ENOMEM);
-
-    err = ff_parse_itu_t_t35_to_dynamic_hdr_vivid(metadata,
-                                                  gb->buffer, bytestream2_get_bytes_left(gb));
-    if (err < 0) {
-        av_free(metadata);
-        return err;
-    }
-
-    av_buffer_unref(&s->info);
-    s->info = av_buffer_create((uint8_t *)metadata, meta_size, NULL, NULL, 0);
-    if (!s->info) {
-        av_free(metadata);
-        return AVERROR(ENOMEM);
-    }
-
-    return 0;
-}
-#endif
-
-static int decode_registered_user_data_afd(H2645SEIAFD *h, GetByteContext *gb)
-{
-    int flag;
-
-    if (bytestream2_get_bytes_left(gb) <= 0)
-        return AVERROR_INVALIDDATA;
-
-    flag = !!(bytestream2_get_byteu(gb) & 0x40); // active_format_flag
-
-    if (flag) {
-        if (bytestream2_get_bytes_left(gb) <= 0)
-            return AVERROR_INVALIDDATA;
-        h->active_format_description = bytestream2_get_byteu(gb) & 0xF;
-        h->present                   = 1;
-    }
-
-    return 0;
-}
-
-static int decode_registered_user_data_closed_caption(H2645SEIA53Caption *h,
-                                                      GetByteContext *gb)
-{
-    return ff_parse_a53_cc(&h->buf_ref, gb->buffer,
-                           bytestream2_get_bytes_left(gb));
-}
+#define IS_H264(codec_id) (CONFIG_H264_SEI && (CONFIG_HEVC_SEI || CONFIG_VVC_SEI ) ? codec_id == AV_CODEC_ID_H264 : CONFIG_H264_SEI)
+#define IS_HEVC(codec_id) (CONFIG_HEVC_SEI && (CONFIG_H264_SEI || CONFIG_VVC_SEI ) ? codec_id == AV_CODEC_ID_HEVC : CONFIG_HEVC_SEI)
+#define IS_VVC(codec_id)  (CONFIG_VVC_SEI  && (CONFIG_H264_SEI || CONFIG_HEVC_SEI) ? codec_id == AV_CODEC_ID_VVC  : CONFIG_VVC_SEI )
 
 static int decode_registered_user_data(H2645SEI *h, GetByteContext *gb,
                                        enum AVCodecID codec_id, void *logctx)
 {
-    int country_code, provider_code;
+    FFITUTT35 itut_t35 = { 0 };
+    FFITUTT35Aux aux = { NULL };
+    int ret;
 
-    if (bytestream2_get_bytes_left(gb) < 3)
-        return AVERROR_INVALIDDATA;
-
-    country_code = bytestream2_get_byteu(gb); // itu_t_t35_country_code
-    if (country_code == 0xFF) {
-        if (bytestream2_get_bytes_left(gb) < 3)
-            return AVERROR_INVALIDDATA;
-
-        bytestream2_skipu(gb, 1);  // itu_t_t35_country_code_extension_byte
-    }
-
-    if (country_code != ITU_T_T35_COUNTRY_CODE_US &&
-        country_code != ITU_T_T35_COUNTRY_CODE_CN) {
+    ret = ff_itut_t35_parse_buffer(&itut_t35, gb->buffer, bytestream2_get_bytes_left(gb), 0);
+    if (!ret)
         av_log(logctx, AV_LOG_VERBOSE,
-               "Unsupported User Data Registered ITU-T T35 SEI message (country_code = %d)\n",
-               country_code);
-        return 0;
-    }
+               "Unsupported User Data Registered ITU-T T35 SEI message (country_code = %d, provider_code = %d)\n",
+               itut_t35.country_code, itut_t35.provider_code);
+    if (ret <= 0)
+        return ret;
 
-    /* itu_t_t35_payload_byte follows */
-    provider_code = bytestream2_get_be16u(gb);
-
-    switch (provider_code) {
-    case ITU_T_T35_PROVIDER_CODE_ATSC: {
-        uint32_t user_identifier;
-
-        if (bytestream2_get_bytes_left(gb) < 4)
-            return AVERROR_INVALIDDATA;
-
-        user_identifier = bytestream2_get_be32u(gb);
-        switch (user_identifier) {
-        case MKBETAG('D', 'T', 'G', '1'):       // afd_data
-            return decode_registered_user_data_afd(&h->afd, gb);
-        case MKBETAG('G', 'A', '9', '4'):       // closed captions
-            return decode_registered_user_data_closed_caption(&h->a53_caption, gb);
-        default:
-            av_log(logctx, AV_LOG_VERBOSE,
-                   "Unsupported User Data Registered ITU-T T35 SEI message (atsc user_identifier = 0x%04x)\n",
-                   user_identifier);
-            break;
-        }
-        break;
-    }
-#if CONFIG_HEVC_SEI
-    case ITU_T_T35_PROVIDER_CODE_CUVA: {
-        const uint16_t cuva_provider_oriented_code = 0x0005;
-        uint16_t provider_oriented_code;
-
-        if (!IS_HEVC(codec_id))
-            goto unsupported_provider_code;
-
-        if (bytestream2_get_bytes_left(gb) < 2)
-            return AVERROR_INVALIDDATA;
-
-        provider_oriented_code = bytestream2_get_be16u(gb);
-        if (provider_oriented_code == cuva_provider_oriented_code) {
-            return decode_registered_user_data_dynamic_hdr_vivid(&h->dynamic_hdr_vivid, gb);
-        }
-        break;
-    }
-    case ITU_T_T35_PROVIDER_CODE_SMTPE: {
-        // A/341 Amendment - 2094-40
-        const uint16_t smpte2094_40_provider_oriented_code = 0x0001;
-        const uint8_t smpte2094_40_application_identifier = 0x04;
-        uint16_t provider_oriented_code;
-        uint8_t application_identifier;
-
-        if (!IS_HEVC(codec_id))
-            goto unsupported_provider_code;
-
-        if (bytestream2_get_bytes_left(gb) < 3)
-            return AVERROR_INVALIDDATA;
-
-        provider_oriented_code = bytestream2_get_be16u(gb);
-        application_identifier = bytestream2_get_byteu(gb);
-        if (provider_oriented_code == smpte2094_40_provider_oriented_code &&
-            application_identifier == smpte2094_40_application_identifier) {
-            return decode_registered_user_data_dynamic_hdr_plus(&h->dynamic_hdr_plus, gb);
-        }
-        break;
-    }
-    case 0x5890: { // aom_provider_code
-        const uint16_t aom_grain_provider_oriented_code = 0x0001;
-        uint16_t provider_oriented_code;
-
-        if (!IS_HEVC(codec_id))
-            goto unsupported_provider_code;
-
-        if (bytestream2_get_bytes_left(gb) < 2)
-            return AVERROR_INVALIDDATA;
-
-        provider_oriented_code = bytestream2_get_byteu(gb);
-        if (provider_oriented_code == aom_grain_provider_oriented_code) {
-            return ff_aom_parse_film_grain_sets(&h->aom_film_grain,
-                                                gb->buffer,
-                                                bytestream2_get_bytes_left(gb));
-        }
-        break;
-    }
-    unsupported_provider_code:
-#endif
-    default:
-        av_log(logctx, AV_LOG_VERBOSE,
-               "Unsupported User Data Registered ITU-T T35 SEI message (provider_code = %d)\n",
-               provider_code);
-        break;
-    }
-
-    return 0;
+    return ff_itut_t35_parse_payload_to_struct(&itut_t35, &aux, &h->itut_t35, 0);
 }
 
 static int decode_unregistered_user_data(H2645SEIUnregistered *h,
@@ -403,7 +226,7 @@ static int decode_film_grain_characteristics(H2645SEIFilmGrainCharacteristics *h
                 }
             }
         }
-        if (IS_HEVC(codec_id))
+        if (!IS_H264(codec_id))
             h->persistence_flag = get_bits1(gb);
         else
             h->repetition_period = get_ue_golomb_long(gb);
@@ -472,7 +295,11 @@ int ff_h2645_sei_message_decode(H2645SEI *h, enum SEIType type,
     case SEI_TYPE_DISPLAY_ORIENTATION:
         return decode_display_orientation(&h->display_orientation, gb);
     case SEI_TYPE_FILM_GRAIN_CHARACTERISTICS:
-        return decode_film_grain_characteristics(&h->film_grain_characteristics, codec_id, gb);
+        av_refstruct_unref(&h->film_grain_characteristics);
+        h->film_grain_characteristics = av_refstruct_allocz(sizeof(*h->film_grain_characteristics));
+        if (!h->film_grain_characteristics)
+            return AVERROR(ENOMEM);
+        return decode_film_grain_characteristics(h->film_grain_characteristics, codec_id, gb);
     case SEI_TYPE_FRAME_PACKING_ARRANGEMENT:
         return decode_frame_packing_arrangement(&h->frame_packing, gb, codec_id);
     case SEI_TYPE_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
@@ -492,14 +319,18 @@ int ff_h2645_sei_message_decode(H2645SEI *h, enum SEIType type,
 
 int ff_h2645_sei_ctx_replace(H2645SEI *dst, const H2645SEI *src)
 {
-    int ret = av_buffer_replace(&dst->a53_caption.buf_ref,
-                                 src->a53_caption.buf_ref);
+    int ret = av_buffer_replace(&dst->itut_t35.a53_cc,
+                                 src->itut_t35.a53_cc);
     if (ret < 0)
         return ret;
 
     for (unsigned i = 0; i < dst->unregistered.nb_buf_ref; i++)
         av_buffer_unref(&dst->unregistered.buf_ref[i]);
     dst->unregistered.nb_buf_ref = 0;
+
+    ret = av_buffer_replace(&dst->itut_t35.lcevc, src->itut_t35.lcevc);
+    if (ret < 0)
+        return ret;
 
     if (src->unregistered.nb_buf_ref) {
         ret = av_reallocp_array(&dst->unregistered.buf_ref,
@@ -515,6 +346,21 @@ int ff_h2645_sei_ctx_replace(H2645SEI *dst, const H2645SEI *src)
             dst->unregistered.nb_buf_ref++;
         }
     }
+
+    for (unsigned i = 0; i < FF_ARRAY_ELEMS(dst->itut_t35.aom_film_grain.sets); i++) {
+        ret = av_buffer_replace(&dst->itut_t35.aom_film_grain.sets[i],
+                                 src->itut_t35.aom_film_grain.sets[i]);
+        if (ret < 0)
+            return ret;
+    }
+    dst->itut_t35.aom_film_grain.enable = src->itut_t35.aom_film_grain.enable;
+
+    dst->ambient_viewing_environment = src->ambient_viewing_environment;
+    dst->mastering_display     = src->mastering_display;
+    dst->content_light         = src->content_light;
+
+    av_refstruct_replace(&dst->film_grain_characteristics,
+                          src->film_grain_characteristics);
 
     return 0;
 }
@@ -563,15 +409,15 @@ static int h2645_sei_to_side_data(AVCodecContext *avctx, H2645SEI *sei,
             return AVERROR(ENOMEM);
         }
 
+        dst_env->ambient_illuminance = av_make_q(env->ambient_illuminance, 10000);
+        dst_env->ambient_light_x     = av_make_q(env->ambient_light_x,     50000);
+        dst_env->ambient_light_y     = av_make_q(env->ambient_light_y,     50000);
+
         ret = ff_frame_new_side_data_from_buf_ext(avctx, sd, nb_sd,
                                                   AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT, &buf);
 
         if (ret < 0)
             return ret;
-
-        dst_env->ambient_illuminance = av_make_q(env->ambient_illuminance, 10000);
-        dst_env->ambient_light_x     = av_make_q(env->ambient_light_x,     50000);
-        dst_env->ambient_light_y     = av_make_q(env->ambient_light_y,     50000);
     }
 
     if (sei->mastering_display.present) {
@@ -619,10 +465,14 @@ static int h2645_sei_to_side_data(AVCodecContext *avctx, H2645SEI *sei,
 
             metadata->min_luminance.num = sei->mastering_display.min_luminance;
             metadata->min_luminance.den = luma_den;
-            metadata->has_luminance &= sei->mastering_display.min_luminance >= 1 &&
-                                       sei->mastering_display.min_luminance <= 50000 &&
+            metadata->has_luminance &= sei->mastering_display.min_luminance <= 50000 &&
                                        sei->mastering_display.min_luminance <
                                        sei->mastering_display.max_luminance;
+
+            /* Real (blu-ray) releases in the wild come with minimum luminance
+             * values of 0.000 cd/m2, so permit this edge case */
+            if (avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT)
+                metadata->has_luminance &= sei->mastering_display.min_luminance >= 1;
 
             if (metadata->has_luminance || metadata->has_primaries)
                 av_log(avctx, AV_LOG_DEBUG, "Mastering Display Metadata:\n");
@@ -672,6 +522,7 @@ int ff_h2645_sei_to_frame(AVFrame *frame, H2645SEI *sei,
                           int seed)
 {
     H2645SEIFramePacking *fp = &sei->frame_packing;
+    FFITUTT35Meta *itut_t35 = &sei->itut_t35;
     int ret;
 
     if (fp->present &&
@@ -751,32 +602,32 @@ int ff_h2645_sei_to_frame(AVFrame *frame, H2645SEI *sei,
                                 o->hflip, o->vflip);
     }
 
-    if (sei->a53_caption.buf_ref) {
-        H2645SEIA53Caption *a53 = &sei->a53_caption;
-        AVFrameSideData *sd = av_frame_new_side_data_from_buf(frame, AV_FRAME_DATA_A53_CC, a53->buf_ref);
+    if (itut_t35->a53_cc) {
+        AVFrameSideData *sd = av_frame_new_side_data_from_buf(frame, AV_FRAME_DATA_A53_CC, itut_t35->a53_cc);
         if (!sd)
-            av_buffer_unref(&a53->buf_ref);
-        a53->buf_ref = NULL;
-        if (avctx)
-            avctx->properties |= FF_CODEC_PROPERTY_CLOSED_CAPTIONS;
+            av_buffer_unref(&itut_t35->a53_cc);
+        itut_t35->a53_cc = NULL;
     }
 
     ret = h2645_sei_to_side_data(avctx, sei, &frame->side_data, &frame->nb_side_data);
     if (ret < 0)
         return ret;
 
-    if (sei->afd.present) {
-        AVFrameSideData *sd = av_frame_new_side_data(frame, AV_FRAME_DATA_AFD,
-                                                     sizeof(uint8_t));
-
-        if (sd) {
-            *sd->data = sei->afd.active_format_description;
-            sei->afd.present = 0;
-        }
+    if (itut_t35->afd) {
+        if (!av_frame_new_side_data_from_buf(frame, AV_FRAME_DATA_AFD, itut_t35->afd))
+            av_buffer_unref(&itut_t35->afd);
+        itut_t35->afd = NULL;
     }
 
-    if (sei->film_grain_characteristics.present) {
-        H2645SEIFilmGrainCharacteristics *fgc = &sei->film_grain_characteristics;
+    if (itut_t35->lcevc) {
+        ret = ff_frame_new_side_data_from_buf(avctx, frame, AV_FRAME_DATA_LCEVC,
+                                              &itut_t35->lcevc);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (sei->film_grain_characteristics && sei->film_grain_characteristics->present) {
+        H2645SEIFilmGrainCharacteristics *fgc = sei->film_grain_characteristics;
         AVFilmGrainParams *fgp = av_film_grain_params_create_side_data(frame);
         AVFilmGrainH274Params *h274;
 
@@ -794,7 +645,7 @@ int ff_h2645_sei_to_frame(AVFrame *frame, H2645SEI *sei,
         fgp->subsampling_x = fgp->subsampling_y = 0;
 
         h274->model_id = fgc->model_id;
-        if (fgc->separate_colour_description_present_flag) {
+        if (IS_VVC(codec_id) || fgc->separate_colour_description_present_flag) {
             fgp->bit_depth_luma   = fgc->bit_depth_luma;
             fgp->bit_depth_chroma = fgc->bit_depth_chroma;
             fgp->color_range      = fgc->full_range + 1;
@@ -815,17 +666,6 @@ int ff_h2645_sei_to_frame(AVFrame *frame, H2645SEI *sei,
         h274->blending_mode_id  = fgc->blending_mode_id;
         h274->log2_scale_factor = fgc->log2_scale_factor;
 
-#if FF_API_H274_FILM_GRAIN_VCS
-FF_DISABLE_DEPRECATION_WARNINGS
-        h274->bit_depth_luma   = fgp->bit_depth_luma;
-        h274->bit_depth_chroma = fgp->bit_depth_chroma;
-        h274->color_range      = fgp->color_range;
-        h274->color_primaries  = fgp->color_primaries;
-        h274->color_trc        = fgp->color_trc;
-        h274->color_space      = fgp->color_space;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-
         memcpy(&h274->component_model_present, &fgc->comp_model_present_flag,
                sizeof(h274->component_model_present));
         memcpy(&h274->num_intensity_intervals, &fgc->num_intensity_intervals,
@@ -843,13 +683,10 @@ FF_ENABLE_DEPRECATION_WARNINGS
             fgc->present = !!fgc->repetition_period;
         else
             fgc->present = fgc->persistence_flag;
-
-        if (avctx)
-            avctx->properties |= FF_CODEC_PROPERTY_FILM_GRAIN;
     }
 
 #if CONFIG_HEVC_SEI
-    ret = ff_aom_attach_film_grain_sets(&sei->aom_film_grain, frame);
+    ret = ff_aom_attach_film_grain_sets(&itut_t35->aom_film_grain, frame);
     if (ret < 0)
         return ret;
 #endif
@@ -865,17 +702,14 @@ int ff_h2645_sei_to_context(AVCodecContext *avctx, H2645SEI *sei)
 
 void ff_h2645_sei_reset(H2645SEI *s)
 {
-    av_buffer_unref(&s->a53_caption.buf_ref);
-
     for (unsigned i = 0; i < s->unregistered.nb_buf_ref; i++)
         av_buffer_unref(&s->unregistered.buf_ref[i]);
     s->unregistered.nb_buf_ref = 0;
     av_freep(&s->unregistered.buf_ref);
-    av_buffer_unref(&s->dynamic_hdr_plus.info);
-    av_buffer_unref(&s->dynamic_hdr_vivid.info);
-
+    ff_itut_t35_unref(&s->itut_t35);
     s->ambient_viewing_environment.present = 0;
     s->mastering_display.present = 0;
     s->content_light.present = 0;
-    s->aom_film_grain.enable = 0;
+
+    av_refstruct_unref(&s->film_grain_characteristics);
 }

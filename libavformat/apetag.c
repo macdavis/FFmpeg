@@ -81,7 +81,7 @@ static int ape_tag_read_field(AVFormatContext *s)
         av_dict_set(&st->metadata, key, filename, 0);
 
         if ((id = ff_guess_image2_codec(filename)) != AV_CODEC_ID_NONE) {
-            int ret = ff_add_attached_pic(s, st, s->pb, NULL, size);
+            ret = ff_add_attached_pic(s, st, s->pb, NULL, size);
             if (ret < 0) {
                 av_log(s, AV_LOG_ERROR, "Error reading cover art.\n");
                 return ret;
@@ -121,7 +121,8 @@ int64_t ff_ape_parse_tag(AVFormatContext *s)
 
     avio_seek(pb, file_size - APE_TAG_FOOTER_BYTES, SEEK_SET);
 
-    avio_read(pb, buf, 8);     /* APETAGEX */
+    if(avio_read(pb, buf, 8) != 8)     /* APETAGEX */
+        return 0;
     if (strncmp(buf, APE_TAG_PREAMBLE, 8)) {
         return 0;
     }

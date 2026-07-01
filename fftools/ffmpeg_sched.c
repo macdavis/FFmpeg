@@ -32,6 +32,7 @@
 #include "libavcodec/packet.h"
 
 #include "libavutil/avassert.h"
+#include "libavutil/container_fifo.h"
 #include "libavutil/error.h"
 #include "libavutil/fifo.h"
 #include "libavutil/frame.h"
@@ -71,15 +72,22 @@ typedef struct SchTask {
     int                 thread_running;
 } SchTask;
 
+typedef struct SchDecOutput {
+    SchedulerNode      *dst;
+    uint8_t            *dst_finished;
+    unsigned         nb_dst;
+} SchDecOutput;
+
 typedef struct SchDec {
     const AVClass      *class;
 
     SchedulerNode       src;
-    SchedulerNode      *dst;
-    uint8_t            *dst_finished;
-    unsigned         nb_dst;
+
+    SchDecOutput       *outputs;
+    unsigned         nb_outputs;
 
     SchTask             task;
+    SchWaiter           waiter;
     // Queue for receiving input packets, one stream.
     ThreadQueue        *queue;
 
@@ -89,6 +97,9 @@ typedef struct SchDec {
 
     // temporary storage used by sch_dec_send()
     AVFrame            *send_frame;
+
+    // internal queue of undecoded packets used by sch_dec_receive()
+    AVContainerFifo    *overflow;
 } SchDec;
 
 typedef struct SchSyncQueue {
@@ -183,7 +194,6 @@ typedef struct PreMuxQueue {
 
 typedef struct SchMuxStream {
     SchedulerNode       src;
-    SchedulerNode       src_sched;
 
     unsigned           *sub_heartbeat_dst;
     unsigned         nb_sub_heartbeat_dst;
@@ -229,7 +239,6 @@ typedef struct SchMux {
 
 typedef struct SchFilterIn {
     SchedulerNode       src;
-    SchedulerNode       src_sched;
     int                 send_finished;
     int                 receive_finished;
 } SchFilterIn;
@@ -243,7 +252,7 @@ typedef struct SchFilterGraph {
 
     SchFilterIn        *inputs;
     unsigned         nb_inputs;
-    atomic_uint      nb_inputs_finished_send;
+    unsigned         nb_inputs_finished_send;
     unsigned         nb_inputs_finished_receive;
 
     SchFilterOut       *outputs;
@@ -279,8 +288,9 @@ struct Scheduler {
     pthread_mutex_t     mux_ready_lock;
 
     unsigned         nb_mux_done;
-    pthread_mutex_t     mux_done_lock;
-    pthread_cond_t      mux_done_cond;
+    unsigned            task_failed;
+    pthread_mutex_t     finish_lock;
+    pthread_cond_t      finish_cond;
 
 
     SchDec             *dec;
@@ -300,7 +310,6 @@ struct Scheduler {
 
     enum SchedulerState state;
     atomic_int          terminate;
-    atomic_int          task_failed;
 
     pthread_mutex_t     schedule_lock;
 
@@ -369,7 +378,6 @@ static int queue_alloc(ThreadQueue **ptq, unsigned nb_streams, unsigned queue_si
                        enum QueueType type)
 {
     ThreadQueue *tq;
-    ObjPool *op;
 
     if (queue_size <= 0) {
         if (type == QUEUE_FRAMES)
@@ -384,20 +392,13 @@ static int queue_alloc(ThreadQueue **ptq, unsigned nb_streams, unsigned queue_si
         // for frames held in queues inside the ffmpeg utility.  If this
         // can ever dynamically change then the corresponding decode
         // code needs to be updated as well.
-        av_assert0(queue_size == DEFAULT_FRAME_THREAD_QUEUE_SIZE);
+        av_assert0(queue_size <= DEFAULT_FRAME_THREAD_QUEUE_SIZE);
     }
 
-    op = (type == QUEUE_PACKETS) ? objpool_alloc_packets() :
-                                   objpool_alloc_frames();
-    if (!op)
+    tq = tq_alloc(nb_streams, queue_size,
+                  (type == QUEUE_PACKETS) ? THREAD_QUEUE_PACKETS : THREAD_QUEUE_FRAMES);
+    if (!tq)
         return AVERROR(ENOMEM);
-
-    tq = tq_alloc(nb_streams, queue_size, op,
-                  (type == QUEUE_PACKETS) ? pkt_move : frame_move);
-    if (!tq) {
-        objpool_free(&op);
-        return AVERROR(ENOMEM);
-    }
 
     *ptq = tq;
     return 0;
@@ -408,6 +409,9 @@ static void *task_wrapper(void *arg);
 static int task_start(SchTask *task)
 {
     int ret;
+
+    if (!task->parent)
+        return 0;
 
     av_log(task->func_arg, AV_LOG_VERBOSE, "Starting thread...\n");
 
@@ -436,7 +440,7 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
     task->func_arg  = func_arg;
 }
 
-static int64_t trailing_dts(const Scheduler *sch, int count_finished)
+static int64_t trailing_dts(const Scheduler *sch)
 {
     int64_t min_dts = INT64_MAX;
 
@@ -446,7 +450,7 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
         for (unsigned j = 0; j < mux->nb_streams; j++) {
             const SchMuxStream *ms = &mux->streams[j];
 
-            if (ms->source_finished && !count_finished)
+            if (ms->source_finished)
                 continue;
             if (ms->last_dts == AV_NOPTS_VALUE)
                 return AV_NOPTS_VALUE;
@@ -456,6 +460,43 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
     }
 
     return min_dts == INT64_MAX ? AV_NOPTS_VALUE : min_dts;
+}
+
+static int64_t progressing_dts(const Scheduler *sch, int count_finished)
+{
+    int64_t max_dts = INT64_MIN;
+
+    for (unsigned i = 0; i < sch->nb_mux; i++) {
+        const SchMux *mux = &sch->mux[i];
+
+        for (unsigned j = 0; j < mux->nb_streams; j++) {
+            const SchMuxStream *ms = &mux->streams[j];
+
+            if (ms->source_finished && !count_finished)
+                continue;
+            if (ms->last_dts != AV_NOPTS_VALUE)
+                max_dts = FFMAX(max_dts, ms->last_dts);
+        }
+    }
+
+    return max_dts == INT64_MIN ? AV_NOPTS_VALUE : max_dts;
+}
+
+void sch_remove_filtergraph(Scheduler *sch, int idx)
+{
+    SchFilterGraph *fg = &sch->filters[idx];
+
+    av_assert0(!fg->task.thread_running);
+    memset(&fg->task, 0, sizeof(fg->task));
+
+    tq_free(&fg->queue);
+
+    av_freep(&fg->inputs);
+    fg->nb_inputs = 0;
+    av_freep(&fg->outputs);
+    fg->nb_outputs = 0;
+
+    fg->task_exited = 1;
 }
 
 void sch_free(Scheduler **psch)
@@ -512,11 +553,20 @@ void sch_free(Scheduler **psch)
         tq_free(&dec->queue);
 
         av_thread_message_queue_free(&dec->queue_end_ts);
+        av_container_fifo_free(&dec->overflow);
 
-        av_freep(&dec->dst);
-        av_freep(&dec->dst_finished);
+        for (unsigned j = 0; j < dec->nb_outputs; j++) {
+            SchDecOutput *o = &dec->outputs[j];
+
+            av_freep(&o->dst);
+            av_freep(&o->dst_finished);
+        }
+
+        av_freep(&dec->outputs);
 
         av_frame_free(&dec->send_frame);
+
+        waiter_uninit(&dec->waiter);
     }
     av_freep(&sch->dec);
 
@@ -559,8 +609,8 @@ void sch_free(Scheduler **psch)
 
     pthread_mutex_destroy(&sch->mux_ready_lock);
 
-    pthread_mutex_destroy(&sch->mux_done_lock);
-    pthread_cond_destroy(&sch->mux_done_cond);
+    pthread_mutex_destroy(&sch->finish_lock);
+    pthread_cond_destroy(&sch->finish_cond);
 
     av_freep(psch);
 }
@@ -590,11 +640,11 @@ Scheduler *sch_alloc(void)
     if (ret)
         goto fail;
 
-    ret = pthread_mutex_init(&sch->mux_done_lock, NULL);
+    ret = pthread_mutex_init(&sch->finish_lock, NULL);
     if (ret)
         goto fail;
 
-    ret = pthread_cond_init(&sch->mux_done_cond, NULL);
+    ret = pthread_cond_init(&sch->finish_cond, NULL);
     if (ret)
         goto fail;
 
@@ -712,14 +762,28 @@ int sch_add_demux_stream(Scheduler *sch, unsigned demux_idx)
     return ret < 0 ? ret : d->nb_streams - 1;
 }
 
+int sch_add_dec_output(Scheduler *sch, unsigned dec_idx)
+{
+    SchDec *dec;
+    int ret;
+
+    av_assert0(dec_idx < sch->nb_dec);
+    dec = &sch->dec[dec_idx];
+
+    ret = GROW_ARRAY(dec->outputs, dec->nb_outputs);
+    if (ret < 0)
+        return ret;
+
+    return dec->nb_outputs - 1;
+}
+
 static const AVClass sch_dec_class = {
     .class_name                = "SchDec",
     .version                   = LIBAVUTIL_VERSION_INT,
     .parent_log_context_offset = offsetof(SchDec, task.func_arg),
 };
 
-int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx,
-                int send_end_ts)
+int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx, int send_end_ts)
 {
     const unsigned idx = sch->nb_dec;
 
@@ -739,6 +803,10 @@ int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx,
     if (!dec->send_frame)
         return AVERROR(ENOMEM);
 
+    ret = sch_add_dec_output(sch, idx);
+    if (ret < 0)
+        return ret;
+
     ret = queue_alloc(&dec->queue, 1, 0, QUEUE_PACKETS);
     if (ret < 0)
         return ret;
@@ -748,6 +816,14 @@ int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx,
         if (ret < 0)
             return ret;
     }
+
+    dec->overflow = av_container_fifo_alloc_avpacket(0);
+    if (!dec->overflow)
+        return AVERROR(ENOMEM);
+
+    ret = waiter_init(&dec->waiter);
+    if (ret < 0)
+        return ret;
 
     return idx;
 }
@@ -943,15 +1019,19 @@ int sch_connect(Scheduler *sch, SchedulerNode src, SchedulerNode dst)
         }
     case SCH_NODE_TYPE_DEC: {
         SchDec *dec;
+        SchDecOutput *o;
 
         av_assert0(src.idx < sch->nb_dec);
         dec = &sch->dec[src.idx];
 
-        ret = GROW_ARRAY(dec->dst, dec->nb_dst);
+        av_assert0(src.idx_stream < dec->nb_outputs);
+        o = &dec->outputs[src.idx_stream];
+
+        ret = GROW_ARRAY(o->dst, o->nb_dst);
         if (ret < 0)
             return ret;
 
-        dec->dst[dec->nb_dst - 1] = dst;
+        o->dst[o->nb_dst - 1] = dst;
 
         // decoded frames go to filters or encoding
         switch (dst.type) {
@@ -1077,22 +1157,52 @@ static int mux_task_start(SchMux *mux)
         return ret;
 
     /* flush the pre-muxing queues */
-    for (unsigned i = 0; i < mux->nb_streams; i++) {
-        SchMuxStream *ms = &mux->streams[i];
+    while (1) {
+        int       min_stream = -1;
+        Timestamp min_ts     = { .ts = AV_NOPTS_VALUE };
+
         AVPacket *pkt;
 
-        while (av_fifo_read(ms->pre_mux_queue.fifo, &pkt, 1) >= 0) {
+        // find the stream with the earliest dts or EOF in pre-muxing queue
+        for (unsigned i = 0; i < mux->nb_streams; i++) {
+            SchMuxStream *ms = &mux->streams[i];
+
+            if (av_fifo_peek(ms->pre_mux_queue.fifo, &pkt, 1, 0) < 0)
+                continue;
+
+            if (!pkt || pkt->dts == AV_NOPTS_VALUE) {
+                min_stream = i;
+                break;
+            }
+
+            if (min_ts.ts == AV_NOPTS_VALUE ||
+                av_compare_ts(min_ts.ts, min_ts.tb, pkt->dts, pkt->time_base) > 0) {
+                min_stream = i;
+                min_ts     = (Timestamp){ .ts = pkt->dts, .tb = pkt->time_base };
+            }
+        }
+
+        if (min_stream >= 0) {
+            SchMuxStream *ms = &mux->streams[min_stream];
+
+            ret = av_fifo_read(ms->pre_mux_queue.fifo, &pkt, 1);
+            av_assert0(ret >= 0);
+
             if (pkt) {
                 if (!ms->init_eof)
-                    ret = tq_send(mux->queue, i, pkt);
+                    ret = tq_send(mux->queue, min_stream, pkt);
                 av_packet_free(&pkt);
                 if (ret == AVERROR_EOF)
                     ms->init_eof = 1;
                 else if (ret < 0)
                     return ret;
             } else
-                tq_send_finish(mux->queue, i);
+                tq_send_finish(mux->queue, min_stream);
+
+            continue;
         }
+
+        break;
     }
 
     atomic_store(&mux->mux_started, 1);
@@ -1208,28 +1318,128 @@ int sch_mux_sub_heartbeat_add(Scheduler *sch, unsigned mux_idx, unsigned stream_
     return 0;
 }
 
-static void unchoke_for_stream(Scheduler *sch, SchedulerNode src)
+enum {
+    UNCHOKE_DEMUX  = (1 << 0),
+    UNCHOKE_FILTER = (1 << 1),
+    UNCHOKE_DECODE = (1 << 2),
+
+    UNCHOKE_ALL = UNCHOKE_DEMUX | UNCHOKE_FILTER | UNCHOKE_DECODE,
+};
+
+static void unchoke_for_stream(Scheduler *sch, SchedulerNode src, int flags);
+
+// Unchoke any filter graphs that are downstream of this node, to prevent it
+// from getting stuck trying to push data to a full queue
+static void unchoke_downstream(Scheduler *sch, SchedulerNode *dst)
+{
+    SchFilterGraph *fg;
+    SchDec *dec;
+    SchEnc *enc;
+    switch (dst->type) {
+    case SCH_NODE_TYPE_DEC:
+        dec = &sch->dec[dst->idx];
+        if (!dec->waiter.choked_next) {
+            for (int i = 0; i < dec->nb_outputs; i++)
+                unchoke_downstream(sch, dec->outputs[i].dst);
+        }
+        break;
+    case SCH_NODE_TYPE_ENC:
+        enc = &sch->enc[dst->idx];
+        for (int i = 0; i < enc->nb_dst; i++)
+            unchoke_downstream(sch, &enc->dst[i]);
+        break;
+    case SCH_NODE_TYPE_MUX:
+        // muxers are never choked
+        break;
+    case SCH_NODE_TYPE_FILTER_IN:
+        fg = &sch->filters[dst->idx];
+        if (fg->best_input == fg->nb_inputs) {
+            fg->waiter.choked_next = 0;
+        } else {
+            // ensure that this filter graph is not stuck waiting for
+            // input from a different upstream source
+            unchoke_for_stream(sch, fg->inputs[fg->best_input].src, UNCHOKE_ALL);
+        }
+        break;
+    default:
+        av_unreachable("Invalid destination node type?");
+        break;
+    }
+}
+
+static void unchoke_for_stream(Scheduler *sch, SchedulerNode src, int flags)
 {
     while (1) {
         SchFilterGraph *fg;
-
-        // fed directly by a demuxer (i.e. not through a filtergraph)
-        if (src.type == SCH_NODE_TYPE_DEMUX) {
-            sch->demux[src.idx].waiter.choked_next = 0;
+        SchDemux *demux;
+        SchDec *dec;
+        switch (src.type) {
+        case SCH_NODE_TYPE_DEMUX:
+            // fed directly by a demuxer (i.e. not through a filtergraph)
+            demux = &sch->demux[src.idx];
+            if (demux->waiter.choked_next == 0)
+                return; // prevent infinite loop
+            if (flags & UNCHOKE_DEMUX) {
+                demux->waiter.choked_next = 0;
+                for (int i = 0; i < demux->nb_streams; i++)
+                    unchoke_downstream(sch, demux->streams[i].dst);
+            }
+            return;
+        case SCH_NODE_TYPE_DEC:
+            dec = &sch->dec[src.idx];
+            if (!(flags & UNCHOKE_DECODE))
+                return;
+            dec->waiter.choked_next = 0;
+            src = dec->src;
+            continue;
+        case SCH_NODE_TYPE_ENC:
+            src = sch->enc[src.idx].src;
+            continue;
+        case SCH_NODE_TYPE_FILTER_OUT:
+            fg = &sch->filters[src.idx];
+            // the filtergraph contains internal sources and
+            // requested to be scheduled directly
+            if (fg->best_input == fg->nb_inputs) {
+                if (flags & UNCHOKE_FILTER)
+                    fg->waiter.choked_next = 0;
+                return;
+            }
+            src = fg->inputs[fg->best_input].src;
+            continue;
+        default:
+            av_unreachable("Invalid source node type?");
             return;
         }
+    }
+}
 
-        av_assert0(src.type == SCH_NODE_TYPE_FILTER_OUT);
-        fg = &sch->filters[src.idx];
+static void choke_demux(const Scheduler *sch, int demux_id, int choked)
+{
+    av_assert1(demux_id < sch->nb_demux);
+    SchDemux *demux = &sch->demux[demux_id];
 
-        // the filtergraph contains internal sources and
-        // requested to be scheduled directly
-        if (fg->best_input == fg->nb_inputs) {
-            fg->waiter.choked_next = 0;
-            return;
+    for (int i = 0; i < demux->nb_streams; i++) {
+        SchedulerNode *dst = demux->streams[i].dst;
+        SchFilterGraph *fg;
+
+        switch (dst->type) {
+        case SCH_NODE_TYPE_DEC:
+            tq_choke(sch->dec[dst->idx].queue, choked);
+            break;
+        case SCH_NODE_TYPE_ENC:
+            tq_choke(sch->enc[dst->idx].queue, choked);
+            break;
+        case SCH_NODE_TYPE_MUX:
+            break;
+        case SCH_NODE_TYPE_FILTER_IN:
+            fg = &sch->filters[dst->idx];
+            if (fg->nb_inputs == 1)
+                tq_choke(fg->queue, choked);
+            break;
+        default:
+            av_unreachable("Invalid destination node type?");
+            break;
         }
-
-        src = fg->inputs[fg->best_input].src_sched;
     }
 }
 
@@ -1243,17 +1453,23 @@ static void schedule_update_locked(Scheduler *sch)
     if (atomic_load(&sch->terminate))
         return;
 
-    dts = trailing_dts(sch, 0);
+    dts = trailing_dts(sch);
 
-    atomic_store(&sch->last_dts, dts);
+    atomic_store(&sch->last_dts, progressing_dts(sch, 0));
 
     // initialize our internal state
-    for (unsigned type = 0; type < 2; type++)
-        for (unsigned i = 0; i < (type ? sch->nb_filters : sch->nb_demux); i++) {
-            SchWaiter *w = type ? &sch->filters[i].waiter : &sch->demux[i].waiter;
-            w->choked_prev = atomic_load(&w->choked);
-            w->choked_next = 1;
-        }
+#define RESET_WAITER(field)                                                    \
+    do {                                                                       \
+        for (unsigned i = 0; i < sch->nb_##field; i++) {                       \
+            SchWaiter *w   = &sch->field[i].waiter;                            \
+            w->choked_prev = atomic_load(&w->choked);                          \
+            w->choked_next = 1;                                                \
+        }                                                                      \
+    } while (0)
+
+    RESET_WAITER(demux);
+    RESET_WAITER(filters);
+    RESET_WAITER(dec);
 
     // figure out the sources that are allowed to proceed
     for (unsigned i = 0; i < sch->nb_mux; i++) {
@@ -1264,39 +1480,65 @@ static void schedule_update_locked(Scheduler *sch)
 
             // unblock sources for output streams that are not finished
             // and not too far ahead of the trailing stream
-            if (ms->source_finished)
+            if (ms->source_finished) {
+                // still allow decoders to drain
+                unchoke_for_stream(sch, ms->src, UNCHOKE_DECODE);
                 continue;
+            }
             if (dts == AV_NOPTS_VALUE && ms->last_dts != AV_NOPTS_VALUE)
                 continue;
             if (dts != AV_NOPTS_VALUE && ms->last_dts - dts >= SCHEDULE_TOLERANCE)
                 continue;
 
             // resolve the source to unchoke
-            unchoke_for_stream(sch, ms->src_sched);
+            unchoke_for_stream(sch, ms->src, UNCHOKE_ALL);
             have_unchoked = 1;
         }
     }
 
+    // also unchoke any sources feeding into closed filter graph inputs, so
+    // that they can observe the downstream EOF
+    for (unsigned i = 0; i < sch->nb_filters; i++) {
+        SchFilterGraph *fg = &sch->filters[i];
+
+        for (unsigned j = 0; j < fg->nb_inputs; j++) {
+            SchFilterIn *fi = &fg->inputs[j];
+            if (fi->receive_finished && !fi->send_finished)
+                unchoke_for_stream(sch, fi->src, UNCHOKE_ALL);
+        }
+    }
+
     // make sure to unchoke at least one source, if still available
-    for (unsigned type = 0; !have_unchoked && type < 2; type++)
-        for (unsigned i = 0; i < (type ? sch->nb_filters : sch->nb_demux); i++) {
-            int exited = type ? sch->filters[i].task_exited : sch->demux[i].task_exited;
-            SchWaiter *w = type ? &sch->filters[i].waiter : &sch->demux[i].waiter;
-            if (!exited) {
-                w->choked_next = 0;
-                have_unchoked  = 1;
-                break;
-            }
-        }
+#define UNCHOKE_ONCE(field)                                                    \
+    do {                                                                       \
+        for (unsigned i = 0; !have_unchoked && i < sch->nb_##field; i++) {     \
+            SchWaiter *w = &sch->field[i].waiter;                              \
+            if (!sch->field[i].task_exited) {                                  \
+                w->choked_next = 0;                                            \
+                have_unchoked  = 1;                                            \
+                break;                                                         \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
 
+    UNCHOKE_ONCE(demux);
+    UNCHOKE_ONCE(filters);
 
-    for (unsigned type = 0; type < 2; type++)
-        for (unsigned i = 0; i < (type ? sch->nb_filters : sch->nb_demux); i++) {
-            SchWaiter *w = type ? &sch->filters[i].waiter : &sch->demux[i].waiter;
-            if (w->choked_prev != w->choked_next)
-                waiter_set(w, w->choked_next);
-        }
+#define UPDATE_WAITER(field)                                                   \
+    do {                                                                       \
+        for (unsigned i = 0; i < sch->nb_##field; i++) {                       \
+            SchWaiter *w = &sch->field[i].waiter;                              \
+            if (w->choked_prev != w->choked_next) {                            \
+                waiter_set(w, w->choked_next);                                 \
+                if (offsetof(Scheduler, field) == offsetof(Scheduler, demux))  \
+                    choke_demux(sch, i, w->choked_next);                       \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
 
+    UPDATE_WAITER(demux);
+    UPDATE_WAITER(filters);
+    UPDATE_WAITER(dec);
 }
 
 enum {
@@ -1304,6 +1546,27 @@ enum {
     CYCLE_NODE_STARTED,
     CYCLE_NODE_DONE,
 };
+
+// Finds the filtergraph or muxer upstream of a scheduler node
+static SchedulerNode src_filtergraph(const Scheduler *sch, SchedulerNode src)
+{
+    while (1) {
+        switch (src.type) {
+        case SCH_NODE_TYPE_DEMUX:
+        case SCH_NODE_TYPE_FILTER_OUT:
+            return src;
+        case SCH_NODE_TYPE_DEC:
+            src = sch->dec[src.idx].src;
+            continue;
+        case SCH_NODE_TYPE_ENC:
+            src = sch->enc[src.idx].src;
+            continue;
+        default:
+            av_unreachable("Invalid source node type?");
+            return (SchedulerNode) {0};
+        }
+    }
+}
 
 static int
 check_acyclic_for_output(const Scheduler *sch, SchedulerNode src,
@@ -1321,22 +1584,23 @@ check_acyclic_for_output(const Scheduler *sch, SchedulerNode src,
         // descend into every input, depth first
         if (src.idx_stream < fg->nb_inputs) {
             const SchFilterIn *fi = &fg->inputs[src.idx_stream++];
+            SchedulerNode node = src_filtergraph(sch, fi->src);
 
             // connected to demuxer, no cycles possible
-            if (fi->src_sched.type == SCH_NODE_TYPE_DEMUX)
+            if (node.type == SCH_NODE_TYPE_DEMUX)
                 continue;
 
             // otherwise connected to another filtergraph
-            av_assert0(fi->src_sched.type == SCH_NODE_TYPE_FILTER_OUT);
+            av_assert0(node.type == SCH_NODE_TYPE_FILTER_OUT);
 
             // found a cycle
-            if (filters_visited[fi->src_sched.idx] == CYCLE_NODE_STARTED)
+            if (filters_visited[node.idx] == CYCLE_NODE_STARTED)
                 return AVERROR(EINVAL);
 
             // place current position on stack and descend
             av_assert0(nb_filters_stack < sch->nb_filters);
             filters_stack[nb_filters_stack++] = src;
-            src = (SchedulerNode){ .idx = fi->src_sched.idx, .idx_stream = 0 };
+            src = (SchedulerNode){ .idx = node.idx, .idx_stream = 0 };
             continue;
         }
 
@@ -1417,15 +1681,20 @@ static int start_prepare(Scheduler *sch)
                    "Decoder not connected to a source\n");
             return AVERROR(EINVAL);
         }
-        if (!dec->nb_dst) {
-            av_log(dec, AV_LOG_ERROR,
-                   "Decoder not connected to any sink\n");
-            return AVERROR(EINVAL);
-        }
 
-        dec->dst_finished = av_calloc(dec->nb_dst, sizeof(*dec->dst_finished));
-        if (!dec->dst_finished)
-            return AVERROR(ENOMEM);
+        for (unsigned j = 0; j < dec->nb_outputs; j++) {
+            SchDecOutput *o = &dec->outputs[j];
+
+            if (!o->nb_dst) {
+                av_log(dec, AV_LOG_ERROR,
+                       "Decoder output %u not connected to any sink\n", j);
+                return AVERROR(EINVAL);
+            }
+
+            o->dst_finished = av_calloc(o->nb_dst, sizeof(*o->dst_finished));
+            if (!o->dst_finished)
+                return AVERROR(ENOMEM);
+        }
     }
 
     for (unsigned i = 0; i < sch->nb_enc; i++) {
@@ -1453,22 +1722,7 @@ static int start_prepare(Scheduler *sch)
         for (unsigned j = 0; j < mux->nb_streams; j++) {
             SchMuxStream *ms = &mux->streams[j];
 
-            switch (ms->src.type) {
-            case SCH_NODE_TYPE_ENC: {
-                SchEnc *enc = &sch->enc[ms->src.idx];
-                if (enc->src.type == SCH_NODE_TYPE_DEC) {
-                    ms->src_sched = sch->dec[enc->src.idx].src;
-                    av_assert0(ms->src_sched.type == SCH_NODE_TYPE_DEMUX);
-                } else {
-                    ms->src_sched = enc->src;
-                    av_assert0(ms->src_sched.type == SCH_NODE_TYPE_FILTER_OUT);
-                }
-                break;
-                }
-            case SCH_NODE_TYPE_DEMUX:
-                ms->src_sched = ms->src;
-                break;
-            default:
+            if (!ms->src.type) {
                 av_log(mux, AV_LOG_ERROR,
                        "Muxer stream #%u not connected to a source\n", j);
                 return AVERROR(EINVAL);
@@ -1486,25 +1740,11 @@ static int start_prepare(Scheduler *sch)
 
         for (unsigned j = 0; j < fg->nb_inputs; j++) {
             SchFilterIn *fi = &fg->inputs[j];
-            SchDec     *dec;
 
             if (!fi->src.type) {
                 av_log(fg, AV_LOG_ERROR,
                        "Filtergraph input %u not connected to a source\n", j);
                 return AVERROR(EINVAL);
-            }
-
-            if (fi->src.type == SCH_NODE_TYPE_FILTER_OUT)
-                fi->src_sched = fi->src;
-            else {
-                av_assert0(fi->src.type == SCH_NODE_TYPE_DEC);
-                dec = &sch->dec[fi->src.idx];
-
-                switch (dec->src.type) {
-                case SCH_NODE_TYPE_DEMUX: fi->src_sched = dec->src;                   break;
-                case SCH_NODE_TYPE_ENC:   fi->src_sched = sch->enc[dec->src.idx].src; break;
-                default: av_assert0(0);
-                }
             }
         }
 
@@ -1595,29 +1835,27 @@ fail:
 
 int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts)
 {
-    int ret, err;
+    int ret;
 
     // convert delay to absolute timestamp
     timeout_us += av_gettime();
 
-    pthread_mutex_lock(&sch->mux_done_lock);
+    pthread_mutex_lock(&sch->finish_lock);
 
     if (sch->nb_mux_done < sch->nb_mux) {
         struct timespec tv = { .tv_sec  =  timeout_us / 1000000,
                                .tv_nsec = (timeout_us % 1000000) * 1000 };
-        pthread_cond_timedwait(&sch->mux_done_cond, &sch->mux_done_lock, &tv);
+        pthread_cond_timedwait(&sch->finish_cond, &sch->finish_lock, &tv);
     }
 
-    ret = sch->nb_mux_done == sch->nb_mux;
+    // abort transcoding if any task failed
+    ret = sch->nb_mux_done == sch->nb_mux || sch->task_failed;
 
-    pthread_mutex_unlock(&sch->mux_done_lock);
+    pthread_mutex_unlock(&sch->finish_lock);
 
     *transcode_ts = atomic_load(&sch->last_dts);
 
-    // abort transcoding if any task failed
-    err = atomic_load(&sch->task_failed);
-
-    return ret || err;
+    return ret;
 }
 
 static int enc_open(Scheduler *sch, SchEnc *enc, const AVFrame *frame)
@@ -1777,7 +2015,7 @@ static int mux_queue_packet(SchMux *mux, SchMuxStream *ms, AVPacket *pkt)
         if (new_size <= packets) {
             av_log(mux, AV_LOG_ERROR,
                    "Too many packets buffered for output stream.\n");
-            return AVERROR(ENOSPC);
+            return AVERROR_BUFFER_TOO_SMALL;
         }
         ret = av_fifo_grow2(q->fifo, new_size - packets);
         if (ret < 0)
@@ -1840,7 +2078,7 @@ static int send_to_mux(Scheduler *sch, SchMux *mux, unsigned stream_idx,
 
 update_schedule:
     // TODO: use atomics to check whether this changes trailing dts
-    // to avoid locking unnecesarily
+    // to avoid locking unnecessarily
     if (dts != AV_NOPTS_VALUE || !pkt) {
         pthread_mutex_lock(&sch->schedule_lock);
 
@@ -2019,7 +2257,7 @@ int sch_mux_receive(Scheduler *sch, unsigned mux_idx, AVPacket *pkt)
     av_assert0(mux_idx < sch->nb_mux);
     mux = &sch->mux[mux_idx];
 
-    ret = tq_receive(mux->queue, &stream_idx, pkt);
+    ret = tq_receive(mux->queue, &stream_idx, pkt, 0);
     pkt->stream_index = stream_idx;
     return ret;
 }
@@ -2083,14 +2321,14 @@ static int mux_done(Scheduler *sch, unsigned mux_idx)
 
     pthread_mutex_unlock(&sch->schedule_lock);
 
-    pthread_mutex_lock(&sch->mux_done_lock);
+    pthread_mutex_lock(&sch->finish_lock);
 
     av_assert0(sch->nb_mux_done < sch->nb_mux);
     sch->nb_mux_done++;
 
-    pthread_cond_signal(&sch->mux_done_cond);
+    pthread_cond_signal(&sch->finish_cond);
 
-    pthread_mutex_unlock(&sch->mux_done_lock);
+    pthread_mutex_unlock(&sch->finish_lock);
 
     return 0;
 }
@@ -2103,6 +2341,12 @@ int sch_dec_receive(Scheduler *sch, unsigned dec_idx, AVPacket *pkt)
     av_assert0(dec_idx < sch->nb_dec);
     dec = &sch->dec[dec_idx];
 
+retry:
+    // Pull a packet from the overflow FIFO while unchoked or expecting EOF ts
+    if (av_container_fifo_can_read(dec->overflow) &&
+        (!atomic_load(&dec->waiter.choked) || dec->expect_end_ts))
+        return av_container_fifo_read(dec->overflow, pkt, 0);
+
     // the decoder should have given us post-flush end timestamp in pkt
     if (dec->expect_end_ts) {
         Timestamp ts = (Timestamp){ .ts = pkt->pts, .tb = pkt->time_base };
@@ -2113,13 +2357,31 @@ int sch_dec_receive(Scheduler *sch, unsigned dec_idx, AVPacket *pkt)
         dec->expect_end_ts = 0;
     }
 
-    ret = tq_receive(dec->queue, &dummy, pkt);
+    ret = tq_receive(dec->queue, &dummy, pkt, 0);
     av_assert0(dummy <= 0);
 
+    // drain packets from overflow queue before returning EOF
+    if (ret == AVERROR_EOF && av_container_fifo_can_read(dec->overflow)) {
+        int terminate = waiter_wait(sch, &dec->waiter);
+        if (terminate)
+            return ret;
+        return av_container_fifo_read(dec->overflow, pkt, 0);
+    } else if (ret < 0)
+        return ret;
+
     // got a flush packet, on the next call to this function the decoder
-    // will give us post-flush end timestamp
-    if (ret >= 0 && !pkt->data && !pkt->side_data_elems && dec->queue_end_ts)
+    // should give us post-flush end timestamp (after draining overflow fifo)
+    if (!pkt->data && !pkt->side_data_elems && dec->queue_end_ts)
         dec->expect_end_ts = 1;
+
+    // we got a packet, but we're currently choked or have existing overflow
+    // packets; so push it to the FIFO first
+    if (atomic_load(&dec->waiter.choked) || av_container_fifo_can_read(dec->overflow)) {
+        ret = av_container_fifo_write(dec->overflow, pkt, 0);
+        if (ret < 0)
+            return ret;
+        goto retry;
+    }
 
     return ret;
 }
@@ -2130,14 +2392,20 @@ static int send_to_filter(Scheduler *sch, SchFilterGraph *fg,
     if (frame)
         return tq_send(fg->queue, in_idx, frame);
 
+    pthread_mutex_lock(&sch->schedule_lock);
+
     if (!fg->inputs[in_idx].send_finished) {
         fg->inputs[in_idx].send_finished = 1;
         tq_send_finish(fg->queue, in_idx);
 
         // close the control stream when all actual inputs are done
-        if (atomic_fetch_add(&fg->nb_inputs_finished_send, 1) == fg->nb_inputs - 1)
+        if (++fg->nb_inputs_finished_send == fg->nb_inputs)
             tq_send_finish(fg->queue, fg->nb_inputs);
+
+        schedule_update_locked(sch);
     }
+
+    pthread_mutex_unlock(&sch->schedule_lock);
     return 0;
 }
 
@@ -2171,21 +2439,26 @@ finish:
     return AVERROR_EOF;
 }
 
-int sch_dec_send(Scheduler *sch, unsigned dec_idx, AVFrame *frame)
+int sch_dec_send(Scheduler *sch, unsigned dec_idx,
+                 unsigned out_idx, AVFrame *frame)
 {
     SchDec *dec;
-    int ret = 0;
+    SchDecOutput *o;
+    int ret;
     unsigned nb_done = 0;
 
     av_assert0(dec_idx < sch->nb_dec);
     dec = &sch->dec[dec_idx];
 
-    for (unsigned i = 0; i < dec->nb_dst; i++) {
-        uint8_t *finished = &dec->dst_finished[i];
+    av_assert0(out_idx < dec->nb_outputs);
+    o = &dec->outputs[out_idx];
+
+    for (unsigned i = 0; i < o->nb_dst; i++) {
+        uint8_t *finished = &o->dst_finished[i];
         AVFrame *to_send  = frame;
 
         // sending a frame consumes it, so make a temporary reference if needed
-        if (i < dec->nb_dst - 1) {
+        if (i < o->nb_dst - 1) {
             to_send = dec->send_frame;
 
             // frame may sometimes contain props only,
@@ -2196,19 +2469,18 @@ int sch_dec_send(Scheduler *sch, unsigned dec_idx, AVFrame *frame)
                 return ret;
         }
 
-        ret = dec_send_to_dst(sch, dec->dst[i], finished, to_send);
+        ret = dec_send_to_dst(sch, o->dst[i], finished, to_send);
         if (ret < 0) {
             av_frame_unref(to_send);
             if (ret == AVERROR_EOF) {
                 nb_done++;
-                ret = 0;
                 continue;
             }
             return ret;
         }
     }
 
-    return (nb_done == dec->nb_dst) ? AVERROR_EOF : 0;
+    return (nb_done == o->nb_dst) ? AVERROR_EOF : 0;
 }
 
 static int dec_done(Scheduler *sch, unsigned dec_idx)
@@ -2223,10 +2495,14 @@ static int dec_done(Scheduler *sch, unsigned dec_idx)
     if (dec->queue_end_ts)
         av_thread_message_queue_set_err_recv(dec->queue_end_ts, AVERROR_EOF);
 
-    for (unsigned i = 0; i < dec->nb_dst; i++) {
-        int err = dec_send_to_dst(sch, dec->dst[i], &dec->dst_finished[i], NULL);
-        if (err < 0 && err != AVERROR_EOF)
-            ret = err_merge(ret, err);
+    for (unsigned i = 0; i < dec->nb_outputs; i++) {
+        SchDecOutput *o = &dec->outputs[i];
+
+        for (unsigned j = 0; j < o->nb_dst; j++) {
+            int err = dec_send_to_dst(sch, o->dst[j], &o->dst_finished[j], NULL);
+            if (err < 0 && err != AVERROR_EOF)
+                ret = err_merge(ret, err);
+        }
     }
 
     return ret;
@@ -2240,7 +2516,7 @@ int sch_enc_receive(Scheduler *sch, unsigned enc_idx, AVFrame *frame)
     av_assert0(enc_idx < sch->nb_enc);
     enc = &sch->enc[enc_idx];
 
-    ret = tq_receive(enc->queue, &dummy, frame);
+    ret = tq_receive(enc->queue, &dummy, frame, 0);
     av_assert0(dummy <= 0);
 
     return ret;
@@ -2329,6 +2605,7 @@ int sch_filter_receive(Scheduler *sch, unsigned fg_idx,
                        unsigned *in_idx, AVFrame *frame)
 {
     SchFilterGraph *fg;
+    int ret, idx;
 
     av_assert0(fg_idx < sch->nb_filters);
     fg = &sch->filters[fg_idx];
@@ -2349,14 +2626,20 @@ int sch_filter_receive(Scheduler *sch, unsigned fg_idx,
     }
 
     if (*in_idx == fg->nb_inputs) {
+        // drain incoming frames before waiting, to avoid blocking downstream
+        ret = tq_receive(fg->queue, &idx, frame, THREAD_QUEUE_FLAG_NO_BLOCK);
+        if (ret >= 0) {
+            av_assert0(idx >= 0);
+            *in_idx = idx;
+            return 0;
+        }
+
         int terminate = waiter_wait(sch, &fg->waiter);
         return terminate ? AVERROR_EOF : AVERROR(EAGAIN);
     }
 
     while (1) {
-        int ret, idx;
-
-        ret = tq_receive(fg->queue, &idx, frame);
+        ret = tq_receive(fg->queue, &idx, frame, 0);
         if (idx < 0)
             return AVERROR_EOF;
         else if (ret >= 0) {
@@ -2380,6 +2663,8 @@ void sch_filter_receive_finish(Scheduler *sch, unsigned fg_idx, unsigned in_idx)
     av_assert0(in_idx < fg->nb_inputs);
     fi = &fg->inputs[in_idx];
 
+    pthread_mutex_lock(&sch->schedule_lock);
+
     if (!fi->receive_finished) {
         fi->receive_finished = 1;
         tq_receive_finish(fg->queue, in_idx);
@@ -2387,13 +2672,18 @@ void sch_filter_receive_finish(Scheduler *sch, unsigned fg_idx, unsigned in_idx)
         // close the control stream when all actual inputs are done
         if (++fg->nb_inputs_finished_receive == fg->nb_inputs)
             tq_receive_finish(fg->queue, fg->nb_inputs);
+
+        schedule_update_locked(sch);
     }
+
+    pthread_mutex_unlock(&sch->schedule_lock);
 }
 
 int sch_filter_send(Scheduler *sch, unsigned fg_idx, unsigned out_idx, AVFrame *frame)
 {
     SchFilterGraph *fg;
     SchedulerNode  dst;
+    int ret;
 
     av_assert0(fg_idx < sch->nb_filters);
     fg = &sch->filters[fg_idx];
@@ -2401,9 +2691,16 @@ int sch_filter_send(Scheduler *sch, unsigned fg_idx, unsigned out_idx, AVFrame *
     av_assert0(out_idx < fg->nb_outputs);
     dst = fg->outputs[out_idx].dst;
 
-    return (dst.type == SCH_NODE_TYPE_ENC)                                    ?
-           send_to_enc   (sch, &sch->enc[dst.idx],                     frame) :
-           send_to_filter(sch, &sch->filters[dst.idx], dst.idx_stream, frame);
+    if (dst.type == SCH_NODE_TYPE_ENC) {
+        ret = send_to_enc(sch, &sch->enc[dst.idx], frame);
+        if (ret == AVERROR_EOF)
+            send_to_enc(sch, &sch->enc[dst.idx], NULL);
+    } else {
+        ret = send_to_filter(sch, &sch->filters[dst.idx], dst.idx_stream, frame);
+        if (ret == AVERROR_EOF)
+            send_to_filter(sch, &sch->filters[dst.idx], dst.idx_stream, NULL);
+    }
+    return ret;
 }
 
 static int filter_done(Scheduler *sch, unsigned fg_idx)
@@ -2445,6 +2742,18 @@ int sch_filter_command(Scheduler *sch, unsigned fg_idx, AVFrame *frame)
     return send_to_filter(sch, fg, fg->nb_inputs, frame);
 }
 
+void sch_filter_choke_inputs(Scheduler *sch, unsigned fg_idx)
+{
+    SchFilterGraph *fg;
+    av_assert0(fg_idx < sch->nb_filters);
+    fg = &sch->filters[fg_idx];
+
+    pthread_mutex_lock(&sch->schedule_lock);
+    fg->best_input = fg->nb_inputs;
+    schedule_update_locked(sch);
+    pthread_mutex_unlock(&sch->schedule_lock);
+}
+
 static int task_cleanup(Scheduler *sch, SchedulerNode node)
 {
     switch (node.type) {
@@ -2453,7 +2762,7 @@ static int task_cleanup(Scheduler *sch, SchedulerNode node)
     case SCH_NODE_TYPE_DEC:         return dec_done   (sch, node.idx);
     case SCH_NODE_TYPE_ENC:         return enc_done   (sch, node.idx);
     case SCH_NODE_TYPE_FILTER_IN:   return filter_done(sch, node.idx);
-    default: av_assert0(0);
+    default: av_unreachable("Invalid node type?");
     }
 }
 
@@ -2475,8 +2784,12 @@ static void *task_wrapper(void *arg)
     // EOF is considered normal termination
     if (ret == AVERROR_EOF)
         ret = 0;
-    if (ret < 0)
-        atomic_store(&sch->task_failed, 1);
+    if (ret < 0) {
+        pthread_mutex_lock(&sch->finish_lock);
+        sch->task_failed = 1;
+        pthread_cond_signal(&sch->finish_cond);
+        pthread_mutex_unlock(&sch->finish_lock);
+    }
 
     av_log(task->func_arg, ret < 0 ? AV_LOG_ERROR : AV_LOG_VERBOSE,
            "Terminating thread with return code %d (%s)\n", ret,
@@ -2489,6 +2802,9 @@ static int task_stop(Scheduler *sch, SchTask *task)
 {
     int ret;
     void *thread_ret;
+
+    if (!task->parent)
+        return 0;
 
     if (!task->thread_running)
         return task_cleanup(sch, task->node);
@@ -2510,11 +2826,22 @@ int sch_stop(Scheduler *sch, int64_t *finish_ts)
 
     atomic_store(&sch->terminate, 1);
 
+    // Ensure no other thread is currently in schedule_update_locked while
+    // we are choking all demuxers
+    pthread_mutex_lock(&sch->schedule_lock);
+
     for (unsigned type = 0; type < 2; type++)
         for (unsigned i = 0; i < (type ? sch->nb_demux : sch->nb_filters); i++) {
             SchWaiter *w = type ? &sch->demux[i].waiter : &sch->filters[i].waiter;
             waiter_set(w, 1);
+            if (type)
+                choke_demux(sch, i, 0); // unfreeze to allow draining
         }
+
+    for (unsigned i = 0; i < sch->nb_dec; i++)
+        waiter_set(&sch->dec[i].waiter, 0); // unfreeze to allow draining
+
+    pthread_mutex_unlock(&sch->schedule_lock);
 
     for (unsigned i = 0; i < sch->nb_demux; i++) {
         SchDemux *d = &sch->demux[i];
@@ -2552,7 +2879,7 @@ int sch_stop(Scheduler *sch, int64_t *finish_ts)
     }
 
     if (finish_ts)
-        *finish_ts = trailing_dts(sch, 1);
+        *finish_ts = progressing_dts(sch, 1);
 
     sch->state = SCH_STATE_STOPPED;
 

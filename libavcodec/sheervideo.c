@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #define CACHED_BITSTREAM_READER !ARCH_X86_32
 #define SHEER_VLC_BITS 12
 
@@ -1863,6 +1864,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         break;
     case MKTAG('A', 'Y', 'B', 'R'):
         s->alt = 1;
+        av_fallthrough;
     case MKTAG('A', 'Y', 'b', 'R'):
         avctx->pix_fmt = AV_PIX_FMT_YUVA444P;
         s->decode_frame = decode_aybr;
@@ -1870,6 +1872,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         break;
     case MKTAG('A', 'y', 'B', 'R'):
         s->alt = 1;
+        av_fallthrough;
     case MKTAG('A', 'y', 'b', 'R'):
         avctx->pix_fmt = AV_PIX_FMT_YUVA444P;
         s->decode_frame = decode_aybri;
@@ -1877,6 +1880,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         break;
     case MKTAG(' ', 'Y', 'B', 'R'):
         s->alt = 1;
+        av_fallthrough;
     case MKTAG(' ', 'Y', 'b', 'R'):
         avctx->pix_fmt = AV_PIX_FMT_YUV444P;
         s->decode_frame = decode_ybr;
@@ -1884,6 +1888,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         break;
     case MKTAG(' ', 'y', 'B', 'R'):
         s->alt = 1;
+        av_fallthrough;
     case MKTAG(' ', 'y', 'b', 'R'):
         avctx->pix_fmt = AV_PIX_FMT_YUV444P;
         s->decode_frame = decode_ybri;
@@ -1971,9 +1976,6 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         av_log(avctx, AV_LOG_ERROR, "Input packet too small\n");
         return AVERROR_INVALIDDATA;
     }
-
-    p->pict_type = AV_PICTURE_TYPE_I;
-    p->flags |= AV_FRAME_FLAG_KEY;
 
     if ((ret = ff_thread_get_buffer(avctx, p, 0)) < 0)
         return ret;

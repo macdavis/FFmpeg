@@ -21,15 +21,25 @@
 #include "ambient_viewing_environment.h"
 #include "mem.h"
 
+static void get_defaults(AVAmbientViewingEnvironment *env)
+{
+    env->ambient_illuminance =
+    env->ambient_light_x     =
+    env->ambient_light_y     = (AVRational) { 0, 1 };
+}
+
 AVAmbientViewingEnvironment *av_ambient_viewing_environment_alloc(size_t *size)
 {
     AVAmbientViewingEnvironment *env =
         av_mallocz(sizeof(AVAmbientViewingEnvironment));
+
+    if (size)
+        *size = env ? sizeof(*env) : 0;
+
     if (!env)
         return NULL;
 
-     if (size)
-        *size = sizeof(*env);
+    get_defaults(env);
 
     return env;
 }
@@ -44,6 +54,7 @@ AVAmbientViewingEnvironment *av_ambient_viewing_environment_create_side_data(AVF
         return NULL;
 
     memset(side_data->data, 0, side_data->size);
+    get_defaults((AVAmbientViewingEnvironment *)side_data->data);
 
     return (AVAmbientViewingEnvironment *)side_data->data;
 }

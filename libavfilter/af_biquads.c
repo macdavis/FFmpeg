@@ -64,6 +64,7 @@
 
 #include "config_components.h"
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/ffmath.h"
@@ -73,7 +74,6 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "formats.h"
-#include "internal.h"
 
 enum FilterType {
     biquad,
@@ -155,9 +155,11 @@ typedef struct BiquadsContext {
                    void *cache, int *clip, int disabled);
 } BiquadsContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    BiquadsContext *s = ctx->priv;
+    const BiquadsContext *s = ctx->priv;
     static const enum AVSampleFormat auto_sample_fmts[] = {
         AV_SAMPLE_FMT_S16P,
         AV_SAMPLE_FMT_S32P,
@@ -170,9 +172,7 @@ static int query_formats(AVFilterContext *ctx)
         AV_SAMPLE_FMT_NONE
     };
     const enum AVSampleFormat *sample_fmts_list = sample_fmts;
-    int ret = ff_set_common_all_channel_counts(ctx);
-    if (ret < 0)
-        return ret;
+    int ret;
 
     switch (s->precision) {
     case 0:
@@ -191,11 +191,11 @@ static int query_formats(AVFilterContext *ctx)
         sample_fmts_list = auto_sample_fmts;
         break;
     }
-    ret = ff_set_common_formats_from_list(ctx, sample_fmts_list);
+    ret = ff_set_sample_formats_from_list2(ctx, cfg_in, cfg_out, sample_fmts_list);
     if (ret < 0)
         return ret;
 
-    return ff_set_common_all_samplerates(ctx);
+    return 0;
 }
 
 #define BIQUAD_FILTER(name, type, ftype, min, max, need_clipping)             \
@@ -858,6 +858,7 @@ static int config_filter(AVFilterLink *outlink, int reset)
         break;
     case bass:
         beta = sqrt((A * A + 1) - (A - 1) * (A - 1));
+        av_fallthrough;
     case tiltshelf:
     case lowshelf:
         if (s->poles == 1) {
@@ -885,6 +886,7 @@ static int config_filter(AVFilterLink *outlink, int reset)
         break;
     case treble:
         beta = sqrt((A * A + 1) - (A - 1) * (A - 1));
+        av_fallthrough;
     case highshelf:
         if (s->poles == 1) {
             double A = ff_exp10(gain / 20);
@@ -1243,8 +1245,8 @@ static int filter_channel(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
     AVFrame *buf = td->in;
     AVFrame *out_buf = td->out;
     BiquadsContext *s = ctx->priv;
-    const int start = (buf->ch_layout.nb_channels * jobnr) / nb_jobs;
-    const int end = (buf->ch_layout.nb_channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(buf->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(buf->ch_layout.nb_channels, jobnr + 1, nb_jobs);
     int ch;
 
     for (ch = start; ch < end; ch++) {
@@ -1454,19 +1456,20 @@ static av_cold int name_##_init(AVFilterContext *ctx)                   \
     return 0;                                                           \
 }                                                                       \
                                                          \
-const AVFilter ff_af_##name_ = {                         \
-    .name          = #name_,                             \
-    .description   = NULL_IF_CONFIG_SMALL(description_), \
-    .priv_class    = &priv_class_##_class,               \
+const FFFilter ff_af_##name_ = {                         \
+    .p.name        = #name_,                             \
+    .p.description = NULL_IF_CONFIG_SMALL(description_), \
+    .p.priv_class  = &priv_class_##_class,               \
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS |       \
+                     AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL, \
     .priv_size     = sizeof(BiquadsContext),             \
     .init          = name_##_init,                       \
     .activate      = activate,                           \
     .uninit        = uninit,                             \
     FILTER_INPUTS(ff_audio_default_filterpad),           \
     FILTER_OUTPUTS(outputs),                             \
-    FILTER_QUERY_FUNC(query_formats),                    \
+    FILTER_QUERY_FUNC2(query_formats),                   \
     .process_command = process_command,                  \
-    .flags         = AVFILTER_FLAG_SLICE_THREADS | AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL, \
 }
 
 #define DEFINE_BIQUAD_FILTER(name, description)                         \

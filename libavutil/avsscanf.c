@@ -669,7 +669,6 @@ static double fffloatscan(FFFILE *f, int prec, int pok)
             while (i--) shunget(f);
             return NAN;
         }
-        return NAN;
     }
 
     if (i) {
@@ -829,6 +828,7 @@ static int ff_vfscanf(FFFILE *f, const char *fmt, va_list ap)
         switch (t) {
             case 'c':
                 if (width < 1) width = 1;
+                break;
             case '[':
                 break;
             case 'n':

@@ -23,6 +23,7 @@
 #include "bytestream.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "libavutil/attributes.h"
 #include "sgi.h"
 
 /**
@@ -241,15 +242,13 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         break;
     case SGI_RGBA:
         MAP(3, 3);
-        /* fallthrough */
+        av_fallthrough;
     case SGI_RGB:
         MAP(0, 2);
         MAP(1, 0);
         MAP(2, 1);
         break;
     }
-    p->pict_type = AV_PICTURE_TYPE_I;
-    p->flags |= AV_FRAME_FLAG_KEY;
 
     /* Skip header. */
     bytestream2_seek(&g, SGI_HEADER_SIZE, SEEK_SET);

@@ -39,18 +39,6 @@
 #define fn2(a,b)   fn3(a,b)
 #define fn(a)      fn2(a, SAMPLE_FORMAT)
 
-#if DEPTH == 64
-static double scalarproduct_double(const double *v1, const double *v2, int len)
-{
-    double p = 0.0;
-
-    for (int i = 0; i < len; i++)
-        p += v1[i] * v2[i];
-
-    return p;
-}
-#endif
-
 static ftype fn(fir_sample)(AudioRLSContext *s, ftype sample, ftype *delay,
                             ftype *coeffs, ftype *tmp, int *offset)
 {
@@ -64,7 +52,7 @@ static ftype fn(fir_sample)(AudioRLSContext *s, ftype sample, ftype *delay,
 #if DEPTH == 32
     output = s->fdsp->scalarproduct_float(delay, tmp, s->kernel_size);
 #else
-    output = scalarproduct_double(delay, tmp, s->kernel_size);
+    output = s->fdsp->scalarproduct_double(delay, tmp, s->kernel_size);
 #endif
 
     if (--(*offset) < 0)
@@ -145,8 +133,8 @@ static int fn(filter_channels)(AVFilterContext *ctx, void *arg, int jobnr, int n
 {
     AudioRLSContext *s = ctx->priv;
     AVFrame *out = arg;
-    const int start = (out->ch_layout.nb_channels * jobnr) / nb_jobs;
-    const int end = (out->ch_layout.nb_channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(out->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(out->ch_layout.nb_channels, jobnr + 1, nb_jobs);
 
     for (int c = start; c < end; c++) {
         const ftype *input = (const ftype *)s->frame[0]->extended_data[c];

@@ -85,12 +85,8 @@ enum {
     iso_Lc   = AV_CHAN_FRONT_LEFT_OF_CENTER,
     iso_Rc   = AV_CHAN_FRONT_RIGHT_OF_CENTER,
     iso_Cs   = AV_CHAN_BACK_CENTER,
-    /* Side and surround are not exactly the same, but in order to have
-     * consistent 5.1/7.1 layouts we map them to the side channels. */
     iso_Ls   = AV_CHAN_SIDE_LEFT,
-    iso_Lss  = AV_CHAN_SIDE_LEFT,
     iso_Rs   = AV_CHAN_SIDE_RIGHT,
-    iso_Rss  = AV_CHAN_SIDE_RIGHT,
     iso_Ts   = AV_CHAN_TOP_CENTER,
     iso_Lv   = AV_CHAN_TOP_FRONT_LEFT,
     iso_Cv   = AV_CHAN_TOP_FRONT_CENTER,
@@ -110,6 +106,8 @@ enum {
     iso_Cb   = AV_CHAN_BOTTOM_FRONT_CENTER,
     iso_Lb   = AV_CHAN_BOTTOM_FRONT_LEFT,
     iso_Rb   = AV_CHAN_BOTTOM_FRONT_RIGHT,
+    iso_Lss  = AV_CHAN_SIDE_SURROUND_LEFT,
+    iso_Rss  = AV_CHAN_SIDE_SURROUND_RIGHT,
     /* The following have no exact counterparts */
     iso_Lvs  = AV_CHAN_NONE,
     iso_Rvs  = AV_CHAN_NONE,
@@ -336,22 +334,28 @@ static const struct {
     enum AVCodecID codec_id;
     const enum MovChannelLayoutTag *layouts;
 } mov_codec_ch_layouts[] = {
-    { AV_CODEC_ID_AAC,     mov_ch_layouts_aac      },
-    { AV_CODEC_ID_AC3,     mov_ch_layouts_ac3      },
-    { AV_CODEC_ID_ALAC,    mov_ch_layouts_alac     },
-    { AV_CODEC_ID_PCM_U8,    mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S8,    mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S16LE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S16BE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S24LE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S24BE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S32LE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_S32BE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_F32LE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_F32BE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_F64LE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_PCM_F64BE, mov_ch_layouts_wav    },
-    { AV_CODEC_ID_NONE,    NULL                    },
+    { AV_CODEC_ID_AAC,          mov_ch_layouts_aac  },
+    { AV_CODEC_ID_AC3,          mov_ch_layouts_ac3  },
+    { AV_CODEC_ID_ADPCM_IMA_QT, mov_ch_layouts_wav  },
+    { AV_CODEC_ID_ALAC,         mov_ch_layouts_alac },
+    { AV_CODEC_ID_MACE3,        mov_ch_layouts_wav  },
+    { AV_CODEC_ID_MACE6,        mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_ALAW,     mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_F32BE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_F32LE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_F64BE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_F64LE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_MULAW,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S16BE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S16LE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S24BE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S24LE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S32BE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S32LE,    mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_S8,       mov_ch_layouts_wav  },
+    { AV_CODEC_ID_PCM_U8,       mov_ch_layouts_wav  },
+    { AV_CODEC_ID_SPEEX,        mov_ch_layouts_wav  },
+    { AV_CODEC_ID_NONE,         NULL                },
 };
 
 static const struct MovChannelLayoutMap* find_layout_map(uint32_t tag, const struct MovChannelLayoutMap *map)
@@ -377,6 +381,7 @@ static int mov_get_channel_layout(AVChannelLayout *ch_layout, uint32_t tag, uint
     /* find the channel layout for the specified layout tag */
     layout_map = find_layout_map(tag, map);
     if (layout_map) {
+        AVChannelLayout tmp = { 0 };
         int ret;
         int map_layout_nb_channels = tag & 0xFFFF;
         int nb_channels = ch_layout->nb_channels;
@@ -385,19 +390,25 @@ static int mov_get_channel_layout(AVChannelLayout *ch_layout, uint32_t tag, uint
         if (omitted_channel_map >> map_layout_nb_channels)
             return AVERROR_INVALIDDATA;
 
-        av_channel_layout_uninit(ch_layout);
-        ret = av_channel_layout_custom_init(ch_layout, nb_channels);
+        ret = av_channel_layout_custom_init(&tmp, nb_channels);
         if (ret < 0)
             return ret;
 
         for (int i = 0, idx = 0; i < map_layout_nb_channels && idx < nb_channels; i++, omitted_channel_map >>= 1) {
             if (!(omitted_channel_map & 1)) {
                 enum AVChannel id = layout_map[i].id;
-                ch_layout->u.map[idx++].id = (id != AV_CHAN_NONE ? id : AV_CHAN_UNKNOWN);
+                tmp.u.map[idx++].id = (id != AV_CHAN_NONE ? id : AV_CHAN_UNKNOWN);
             }
         }
 
-        return av_channel_layout_retype(ch_layout, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
+        ret = av_channel_layout_retype(&tmp, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
+        if (ret < 0) {
+            av_channel_layout_uninit(&tmp);
+            return ret;
+        }
+
+        av_channel_layout_uninit(ch_layout);
+        *ch_layout = tmp;
     }
     return 0;
 }
@@ -495,11 +506,24 @@ int ff_mov_get_channel_layout_tag(const AVCodecParameters *par,
     /* if no tag was found, use channel bitmap or description as a backup if possible */
     if (tag == 0) {
         uint32_t *channel_desc;
-        if (par->ch_layout.order == AV_CHANNEL_ORDER_NATIVE &&
-            par->ch_layout.u.mask < 0x40000) {
-            *layout = MOV_CH_LAYOUT_USE_BITMAP;
-            *bitmap = (uint32_t)par->ch_layout.u.mask;
-            return 0;
+
+        if (par->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+            /* Parsers and encoders (e.g. AC3, AAC, ALAC) indicate/propagate the bitstream's
+             * channel configuration using "standard" layouts in AV_CHANNEL_ORDER_NATIVE but
+             * the encoded bitstream's channels are not actually in that order. Don't return
+             * a channel layout bitmap or description using a conflicting channel order, as
+             * some software will incorrectly override the bitstream-provided information
+             * using the chan atom's data instead (e.g. afinfo/afplay for AAC in MOV) */
+            if (layouts != mov_ch_layouts_wav) {
+                *layout = MOV_CH_LAYOUT_UNKNOWN;
+                return 0;
+            }
+
+            if (par->ch_layout.u.mask < 0x40000) {
+                *layout = MOV_CH_LAYOUT_USE_BITMAP;
+                *bitmap = (uint32_t)par->ch_layout.u.mask;
+                return 0;
+            }
         } else if (par->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
             return AVERROR(ENOSYS);
 
@@ -545,15 +569,27 @@ int ff_mov_read_chan(AVFormatContext *s, AVIOContext *pb, AVStream *st,
         return 0;
 
     if (layout_tag == MOV_CH_LAYOUT_USE_DESCRIPTIONS) {
-        int nb_channels = ch_layout->nb_channels ? ch_layout->nb_channels : num_descr;
-        if (num_descr > nb_channels) {
-            av_log(s, AV_LOG_WARNING, "got %d channel descriptions, capping to the number of channels %d\n",
+        AVChannelLayout tmp = { 0 };
+        int nb_channels = ch_layout->nb_channels;
+
+        if (!num_descr || num_descr < nb_channels) {
+            av_log(s, AV_LOG_ERROR, "got %"PRIu32" channel descriptions when at least %d were needed\n",
                    num_descr, nb_channels);
+            return AVERROR_INVALIDDATA;
+        }
+
+        if (num_descr > nb_channels) {
+            int strict = s->strict_std_compliance >= FF_COMPLIANCE_STRICT;
+            av_log(s, strict ? AV_LOG_ERROR : AV_LOG_WARNING,
+                   "got %"PRIu32" channel descriptions when number of channels is %d\n",
+                   num_descr, nb_channels);
+            if (strict)
+                return AVERROR_INVALIDDATA;
+            av_log(s, AV_LOG_WARNING, "capping channel descriptions to the number of channels\n");
             num_descr = nb_channels;
         }
 
-        av_channel_layout_uninit(ch_layout);
-        ret = av_channel_layout_custom_init(ch_layout, nb_channels);
+        ret = av_channel_layout_custom_init(&tmp, nb_channels);
         if (ret < 0)
             goto out;
 
@@ -562,6 +598,7 @@ int ff_mov_read_chan(AVFormatContext *s, AVIOContext *pb, AVStream *st,
             if (pb->eof_reached) {
                 av_log(s, AV_LOG_ERROR,
                        "reached EOF while reading channel layout\n");
+                av_channel_layout_uninit(&tmp);
                 return AVERROR_INVALIDDATA;
             }
             label     = avio_rb32(pb);          // mChannelLabel
@@ -570,12 +607,17 @@ int ff_mov_read_chan(AVFormatContext *s, AVIOContext *pb, AVStream *st,
             avio_rl32(pb);                      // mCoordinates[1]
             avio_rl32(pb);                      // mCoordinates[2]
             size -= 20;
-            ch_layout->u.map[i].id = mov_get_channel_id(label);
+            tmp.u.map[i].id = mov_get_channel_id(label);
         }
 
-        ret = av_channel_layout_retype(ch_layout, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
-        if (ret < 0)
+        ret = av_channel_layout_retype(&tmp, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
+        if (ret < 0) {
+            av_channel_layout_uninit(&tmp);
             goto out;
+        }
+
+        av_channel_layout_uninit(ch_layout);
+        *ch_layout = tmp;
     } else if (layout_tag == MOV_CH_LAYOUT_USE_BITMAP) {
         if (!ch_layout->nb_channels || av_popcount(bitmap) == ch_layout->nb_channels) {
             if (bitmap < 0x40000) {
@@ -609,129 +651,51 @@ out:
 
 /* ISO/IEC 23001-8, table 8 */
 static const enum AVChannel iso_channel_position[] = {
-    // 0: left front
-    AV_CHAN_FRONT_LEFT,
+     [0] = AV_CHAN_FRONT_LEFT,              // left front
+     [1] = AV_CHAN_FRONT_RIGHT,             // right front
+     [2] = AV_CHAN_FRONT_CENTER,            // centre front
+     [3] = AV_CHAN_LOW_FREQUENCY,           // low frequency enhancement
+     [4] = AV_CHAN_SIDE_LEFT,               // left surround
+     [5] = AV_CHAN_SIDE_RIGHT,              // right surround
+     [6] = AV_CHAN_FRONT_LEFT_OF_CENTER,    // left front centre
+     [7] = AV_CHAN_FRONT_RIGHT_OF_CENTER,   // right front centre
+     [8] = AV_CHAN_BACK_LEFT,               // rear surround left
+     [9] = AV_CHAN_BACK_RIGHT,              // rear surround right
+    [10] = AV_CHAN_BACK_CENTER,             // rear centre
+    [11] = AV_CHAN_SURROUND_DIRECT_LEFT,    // left surround direct
+    [12] = AV_CHAN_SURROUND_DIRECT_RIGHT,   // right surround direct
+    [13] = AV_CHAN_SIDE_SURROUND_LEFT,      // left side surround
+    [14] = AV_CHAN_SIDE_SURROUND_RIGHT,     // right side surround
+    [15] = AV_CHAN_WIDE_LEFT,               // left wide front
+    [16] = AV_CHAN_WIDE_RIGHT,              // right wide front
+    [17] = AV_CHAN_TOP_FRONT_LEFT,          // left front vertical height
+    [18] = AV_CHAN_TOP_FRONT_RIGHT,         // right front vertical height
+    [19] = AV_CHAN_TOP_FRONT_CENTER,        // centre front vertical height
+    [20] = AV_CHAN_TOP_BACK_LEFT,           // left surround vertical height rear
+    [21] = AV_CHAN_TOP_BACK_RIGHT,          // right surround vertical height rear
+    [22] = AV_CHAN_TOP_BACK_CENTER,         // centre vertical height rear
+    [23] = AV_CHAN_TOP_SIDE_LEFT,           // left vertical height side surround
+    [24] = AV_CHAN_TOP_SIDE_RIGHT,          // right vertical height side surround
+    [25] = AV_CHAN_TOP_CENTER,              // top centre surround
+    [26] = AV_CHAN_LOW_FREQUENCY_2,         // low frequency enhancement 2
+    [27] = AV_CHAN_BOTTOM_FRONT_LEFT,       // left front vertical bottom
+    [28] = AV_CHAN_BOTTOM_FRONT_RIGHT,      // right front vertical bottom
+    [29] = AV_CHAN_BOTTOM_FRONT_CENTER,     // centre front vertical bottom
+    [30] = AV_CHAN_TOP_SURROUND_LEFT,       // left vertical height surround
+    [31] = AV_CHAN_TOP_SURROUND_RIGHT,      // right vertical height surround
 
-    // 1: right front
-    AV_CHAN_FRONT_RIGHT,
+    [32] = AV_CHAN_NONE,                    // reserved
+    [33] = AV_CHAN_NONE,                    // reserved
+    [34] = AV_CHAN_NONE,                    // reserved
+    [35] = AV_CHAN_NONE,                    // reserved
 
-    // 2: centre front
-    AV_CHAN_FRONT_CENTER,
-
-    // 3: low frequence enhancement
-    AV_CHAN_LOW_FREQUENCY,
-
-    // 4: left surround
-    // TODO
-    AV_CHAN_NONE,
-
-    // 5: right surround
-    // TODO
-    AV_CHAN_NONE,
-
-    // 6: left front centre
-    AV_CHAN_FRONT_LEFT_OF_CENTER,
-
-    // 7: right front centre
-    AV_CHAN_FRONT_RIGHT_OF_CENTER,
-
-    // 8: rear surround left
-    AV_CHAN_BACK_LEFT,
-
-    // 9: rear surround right
-    AV_CHAN_BACK_RIGHT,
-
-    // 10: rear centre
-    AV_CHAN_BACK_CENTER,
-
-    // 11: left surround direct
-    AV_CHAN_SURROUND_DIRECT_LEFT,
-
-    // 12: right surround direct
-    AV_CHAN_SURROUND_DIRECT_RIGHT,
-
-    // 13: left side surround
-    AV_CHAN_SIDE_LEFT,
-
-    // 14: right side surround
-    AV_CHAN_SIDE_RIGHT,
-
-    // 15: left wide front
-    AV_CHAN_WIDE_LEFT,
-
-    // 16: right wide front
-    AV_CHAN_WIDE_RIGHT,
-
-    // 17: left front vertical height
-    AV_CHAN_TOP_FRONT_LEFT,
-
-    // 18: right front vertical height
-    AV_CHAN_TOP_FRONT_RIGHT,
-
-    // 19: centre front vertical height
-    AV_CHAN_TOP_FRONT_CENTER,
-
-    // 20: left surround vertical height rear
-    AV_CHAN_TOP_BACK_LEFT,
-
-    // 21: right surround vertical height rear
-    AV_CHAN_TOP_BACK_RIGHT,
-
-    // 22: centre vertical height rear
-    AV_CHAN_TOP_BACK_CENTER,
-
-    // 23: left vertical height side surround
-    AV_CHAN_TOP_SIDE_LEFT,
-
-    // 24: right vertical height side surround
-    AV_CHAN_TOP_SIDE_RIGHT,
-
-    // 25: top centre surround
-    AV_CHAN_TOP_CENTER,
-
-    // 26: low frequency enhancement 2
-    AV_CHAN_LOW_FREQUENCY_2,
-
-    // 27: left front vertical bottom
-    AV_CHAN_BOTTOM_FRONT_LEFT,
-
-    // 28: right front vertical bottom
-    AV_CHAN_BOTTOM_FRONT_RIGHT,
-
-    // 29: centre front vertical bottom
-    AV_CHAN_BOTTOM_FRONT_CENTER,
-
-    // 30: left vertical height surround
-    // TODO
-    AV_CHAN_NONE,
-
-    // 31: right vertical height surround
-    // TODO
-    AV_CHAN_NONE,
-
-    // 32, 33, 34, 35, reserved
-    AV_CHAN_NONE,
-    AV_CHAN_NONE,
-    AV_CHAN_NONE,
-    AV_CHAN_NONE,
-
-    // 36: low frequency enhancement 3
-    AV_CHAN_NONE,
-
-    // 37: left edge of screen
-    AV_CHAN_NONE,
-    // 38: right edge of screen
-    AV_CHAN_NONE,
-    // 39: half-way between centre of screen and left edge of screen
-    AV_CHAN_NONE,
-    // 40: half-way between centre of screen and right edge of screen
-    AV_CHAN_NONE,
-
-    // 41: left back surround
-    AV_CHAN_NONE,
-
-    // 42: right back surround
-    AV_CHAN_NONE,
+    [36] = AV_CHAN_NONE,                    // low frequency enhancement 3
+    [37] = AV_CHAN_NONE,                    // left edge of screen
+    [38] = AV_CHAN_NONE,                    // right edge of screen
+    [39] = AV_CHAN_NONE,                    // half-way between centre of screen and left edge of screen
+    [40] = AV_CHAN_NONE,                    // half-way between centre of screen and right edge of screen
+    [41] = AV_CHAN_NONE,                    // left back surround
+    [42] = AV_CHAN_NONE,                    // right back surround
 
     // 43 - 125: reserved
     // 126: explicit position
@@ -752,7 +716,14 @@ int ff_mov_get_channel_config_from_layout(const AVChannelLayout *layout, int *co
     return 0;
 }
 
-int ff_mov_get_channel_layout_from_config(int config, AVChannelLayout *layout, uint64_t omitted_channel_map)
+/**
+ * Get AVChannelLayout from ISO/IEC 23001-8 ChannelConfiguration.
+ *
+ * @return 1  if the config was unknown, layout is untouched in this case
+ *         0  if the config was found
+ *         <0 on error
+ */
+static int mov_get_channel_layout_from_config(int config, AVChannelLayout *layout, uint64_t omitted_channel_map)
 {
     if (config > 0) {
         uint32_t layout_tag;
@@ -794,10 +765,17 @@ int ff_mov_get_channel_positions_from_layout(const AVChannelLayout *layout,
     return 0;
 }
 
-int ff_mov_read_chnl(AVFormatContext *s, AVIOContext *pb, AVStream *st)
+int ff_mov_read_chnl(AVFormatContext *s, AVIOContext *pb, AVStream *st, int version)
 {
     int stream_structure = avio_r8(pb);
+    int base_channel_count;
+    int obj_count = 0;
     int ret;
+
+    if (version == 1) {
+        stream_structure >>= 4;
+        base_channel_count = avio_r8(pb);
+    }
 
     // stream carries channels
     if (stream_structure & 1) {
@@ -805,11 +783,17 @@ int ff_mov_read_chnl(AVFormatContext *s, AVIOContext *pb, AVStream *st)
 
         av_log(s, AV_LOG_TRACE, "'chnl' layout %d\n", layout);
         if (!layout) {
-            AVChannelLayout *ch_layout = &st->codecpar->ch_layout;
+            AVChannelLayout tmp = { 0 }, *ch_layout = &st->codecpar->ch_layout;
             int nb_channels = ch_layout->nb_channels;
 
-            av_channel_layout_uninit(ch_layout);
-            ret = av_channel_layout_custom_init(ch_layout, nb_channels);
+            if (version == 1) {
+                nb_channels = avio_r8(pb);
+                obj_count = base_channel_count - nb_channels;
+                if (obj_count < 0)
+                    return AVERROR_INVALIDDATA;
+            }
+
+            ret = av_channel_layout_custom_init(&tmp, nb_channels);
             if (ret < 0)
                 return ret;
 
@@ -830,23 +814,44 @@ int ff_mov_read_chnl(AVFormatContext *s, AVIOContext *pb, AVStream *st)
                     channel = AV_CHAN_UNKNOWN;
                 }
 
-                ch_layout->u.map[i].id = channel;
+                tmp.u.map[i].id = channel;
             }
 
-            ret = av_channel_layout_retype(ch_layout, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
-            if (ret < 0)
+            ret = av_channel_layout_retype(&tmp, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
+            if (ret < 0) {
+                av_channel_layout_uninit(&tmp);
                 return ret;
+            }
+            av_channel_layout_uninit(ch_layout);
+            *ch_layout = tmp;
         } else {
-            uint64_t omitted_channel_map = avio_rb64(pb);
-            ret = ff_mov_get_channel_layout_from_config(layout, &st->codecpar->ch_layout, omitted_channel_map);
-            if (ret < 0)
-                return ret;
+            uint64_t omitted_channel_map = 0;
+            int omitted_channel_present = 1, channel_order_definition = 0;
+
+            if (version == 1) {
+                int byte = avio_r8(pb);
+                omitted_channel_present  =  byte       & 1;
+                channel_order_definition = (byte >> 1) & 0x7;
+            }
+
+            if (omitted_channel_present)
+                omitted_channel_map = avio_rb64(pb);
+            if (!channel_order_definition) {
+                ret = mov_get_channel_layout_from_config(layout, &st->codecpar->ch_layout, omitted_channel_map);
+                if (ret < 0)
+                    return ret;
+            } else
+                av_log(s, AV_LOG_TRACE, "'chnl' with channel_order_definition %d\n", channel_order_definition);
+
+            if (version == 1)
+                obj_count = base_channel_count - st->codecpar->ch_layout.nb_channels;
         }
     }
 
     // stream carries objects
     if (stream_structure & 2) {
-        int obj_count = avio_r8(pb);
+        if (version == 0)
+            obj_count = avio_r8(pb);
         av_log(s, AV_LOG_TRACE, "'chnl' with object_count %d\n", obj_count);
     }
 

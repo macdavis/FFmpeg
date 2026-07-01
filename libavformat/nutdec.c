@@ -20,6 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
 #include "libavutil/bswap.h"
@@ -881,8 +882,6 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
     int count = ffio_read_varlen(bc);
     int skip_start = 0;
     int skip_end = 0;
-    int channels = 0;
-    int64_t channel_layout = 0;
     int sample_rate = 0;
     int width = 0;
     int height = 0;
@@ -930,7 +929,7 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
                 AV_WB64(dst, v64);
                 dst += 8;
             } else if (!strcmp(name, "ChannelLayout") && value_len == 8) {
-                channel_layout = avio_rl64(bc);
+                // Ignored
                 continue;
             } else {
                 av_log(s, AV_LOG_WARNING, "Unknown data %s / %s\n", name, type_str);
@@ -952,7 +951,7 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
             } else if (!strcmp(name, "SkipEnd")) {
                 skip_end = value;
             } else if (!strcmp(name, "Channels")) {
-                channels = value;
+                // Ignored
             } else if (!strcmp(name, "SampleRate")) {
                 sample_rate = value;
             } else if (!strcmp(name, "Width")) {
@@ -965,18 +964,14 @@ static int read_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int 
         }
     }
 
-    if (channels || channel_layout || sample_rate || width || height) {
-        uint8_t *dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PARAM_CHANGE, 28);
+    if (sample_rate || width || height) {
+        uint8_t *dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PARAM_CHANGE, 16);
         if (!dst)
             return AVERROR(ENOMEM);
         bytestream_put_le32(&dst,
                             AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE*(!!sample_rate) +
                             AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS*(!!(width|height))
                            );
-        if (channels)
-            bytestream_put_le32(&dst, channels);
-        if (channel_layout)
-            bytestream_put_le64(&dst, channel_layout);
         if (sample_rate)
             bytestream_put_le32(&dst, sample_rate);
         if (width || height){
@@ -1188,12 +1183,14 @@ static int nut_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (decode_syncpoint(nut, &ts, &back_ptr) < 0)
                 goto resync;
             frame_code = avio_r8(bc);
+            av_fallthrough;
         case 0:
             ret = decode_frame(nut, pkt, frame_code);
             if (ret == 0)
                 return 0;
             else if (ret == 1) // OK but discard packet
                 break;
+            av_fallthrough;
         default:
 resync:
             av_log(s, AV_LOG_DEBUG, "syncing from %"PRId64"\n", pos);

@@ -29,7 +29,7 @@
 #include "libavutil/mem.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct ThreadData {
@@ -126,8 +126,8 @@ static int convert_frame(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs
     AVFrame *in = td->in;
     AVFrame *out = td->out;
     AVFilterLink *outlink = ctx->outputs[0];
-    const int slice_start = (out->height * jobnr) / nb_jobs;
-    const int slice_end = (out->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(out->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(out->height, jobnr + 1, nb_jobs);
     float rgb[3], lab[3];
 
     for (int i = slice_start; i < slice_end; i++) {
@@ -193,8 +193,8 @@ static int correct_frame(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs
     ThreadData *td = arg;
     AVFrame *out = td->out;
     AVFilterLink *outlink = ctx->outputs[0];
-    const int slice_start = (out->height * jobnr) / nb_jobs;
-    const int slice_end = (out->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(out->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(out->height, jobnr + 1, nb_jobs);
     float rgb[3], lab[3];
 
     for (int i = slice_start; i < slice_end; i++) {
@@ -266,10 +266,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
     /* input and output transfer will be linear */
     if (in->color_trc == AVCOL_TRC_UNSPECIFIED) {
-        av_log(s, AV_LOG_WARNING, "Untagged transfer, assuming linear light.\n");
+        av_log(ctx, AV_LOG_WARNING, "Untagged transfer, assuming linear light.\n");
         out->color_trc = AVCOL_TRC_LINEAR;
     } else if (in->color_trc != AVCOL_TRC_LINEAR) {
-        av_log(s, AV_LOG_WARNING, "Gray world color correction works on linear light only.\n");
+        av_log(ctx, AV_LOG_WARNING, "Gray world color correction works on linear light only.\n");
     }
 
     td.in = in;
@@ -297,13 +297,13 @@ static const AVFilterPad grayworld_inputs[] = {
     }
 };
 
-const AVFilter ff_vf_grayworld = {
-    .name          = "grayworld",
-    .description   = NULL_IF_CONFIG_SMALL("Adjust white balance using LAB gray world algorithm"),
+const FFFilter ff_vf_grayworld = {
+    .p.name        = "grayworld",
+    .p.description = NULL_IF_CONFIG_SMALL("Adjust white balance using LAB gray world algorithm"),
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(GrayWorldContext),
     FILTER_INPUTS(grayworld_inputs),
     FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS(AV_PIX_FMT_GBRPF32, AV_PIX_FMT_GBRAPF32),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .uninit        = uninit,
 };

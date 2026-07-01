@@ -91,7 +91,7 @@ static int my_ass_subtitle_header(AVCodecContext *avctx)
     if (ret < 0)
         return ret;
 
-    event_pos = strstr(avctx->subtitle_header, "\r\n[Events]\r\n");
+    event_pos = strstr(avctx->subtitle_header, "\n[Events]\n");
     if (!event_pos)
         return AVERROR_BUG;
 
@@ -106,7 +106,7 @@ static int my_ass_subtitle_header(AVCodecContext *avctx)
         "0,0,"                 /* Spacing, Angle */
         "3,0.1,0,"             /* BorderStyle, Outline, Shadow */
         "5,1,1,1,"             /* Alignment, Margin[LRV] */
-        "0\r\n"                /* Encoding */
+        "0\n"                  /* Encoding */
         "Style: "
         "Subtitle,"            /* Name */
         "Monospace,16,"        /* Font{name,size} */
@@ -116,7 +116,7 @@ static int my_ass_subtitle_header(AVCodecContext *avctx)
         "0,0,"                 /* Spacing, Angle */
         "1,1,1,"               /* BorderStyle, Outline, Shadow */
         "8,48,48,20,"          /* Alignment, Margin[LRV] */
-        "0\r\n"                /* Encoding */
+        "0\n"                  /* Encoding */
         , event_pos);
 
     if (!new_header)
@@ -428,6 +428,7 @@ static void fix_transparency(TeletextContext *ctx, AVSubtitleRect *sub_rect, vbi
                 case VBI_OPAQUE:
                     if (!ctx->transparent_bg)
                         break;
+                    av_fallthrough;
                 case VBI_SEMI_TRANSPARENT:
                     if (ctx->opacity > 0) {
                         if (ctx->opacity < 255)
@@ -436,6 +437,7 @@ static void fix_transparency(TeletextContext *ctx, AVSubtitleRect *sub_rect, vbi
                                     *pixel += VBI_NB_COLORS;
                         break;
                     }
+                    av_fallthrough;
                 case VBI_TRANSPARENT_FULL:
                     for(; pixel < pixelnext; pixel++)
                         if (*pixel == vc->background)

@@ -78,9 +78,13 @@
 #include "libavdevice/avdevice.h"
 
 #include "cmdutils.h"
+#if CONFIG_MEDIACODEC
+#include "compat/android/binder.h"
+#endif
 #include "ffmpeg.h"
 #include "ffmpeg_sched.h"
 #include "ffmpeg_utils.h"
+#include "graph/graphprint.h"
 
 const char program_name[] = "ffmpeg";
 const int program_birth_year = 2000;
@@ -212,6 +216,16 @@ void term_init(void)
 #endif
 
 #if HAVE_TERMIOS_H
+    /* A closed fd 0 is later reused by the first opened input file. read_key()
+     * would then read from that input instead of the terminal and corrupt the
+     * stream, so disable interaction when fd 0 is not an open descriptor.
+     */
+    if (stdin_interaction && fcntl(0, F_GETFD) == -1) {
+        av_log(NULL, AV_LOG_WARNING,
+               "fd 0 is not an open file descriptor, stdin interaction disabled\n");
+        stdin_interaction = 0;
+    }
+
     if (stdin_interaction) {
         struct termios tty;
         if (tcgetattr (0, &tty) == 0) {
@@ -249,7 +263,6 @@ void term_init(void)
 /* read a key without blocking */
 static int read_key(void)
 {
-    unsigned char ch;
 #if HAVE_TERMIOS_H
     int n = 1;
     struct timeval tv;
@@ -261,6 +274,7 @@ static int read_key(void)
     tv.tv_usec = 0;
     n = select(1, &rfds, NULL, NULL, &tv);
     if (n > 0) {
+        unsigned char ch;
         n = read(0, &ch, 1);
         if (n == 1)
             return ch;
@@ -285,8 +299,10 @@ static int read_key(void)
         }
         //Read it
         if(nchars != 0) {
-            read(0, &ch, 1);
-            return ch;
+            unsigned char ch;
+            if (read(0, &ch, 1) == 1)
+                return ch;
+            return 0;
         }else{
             return -1;
         }
@@ -307,9 +323,12 @@ const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
 
 static void ffmpeg_cleanup(int ret)
 {
+    if ((print_graphs || print_graphs_file) && nb_output_files > 0)
+        print_filtergraphs(filtergraphs, nb_filtergraphs, input_files, nb_input_files, output_files, nb_output_files);
+
     if (do_benchmark) {
-        int maxrss = getmaxrss() / 1024;
-        av_log(NULL, AV_LOG_INFO, "bench: maxrss=%iKiB\n", maxrss);
+        int64_t maxrss = getmaxrss() / 1024;
+        av_log(NULL, AV_LOG_INFO, "bench: maxrss=%"PRId64"KiB\n", maxrss);
     }
 
     for (int i = 0; i < nb_filtergraphs; i++)
@@ -338,6 +357,9 @@ static void ffmpeg_cleanup(int ret)
     hw_device_free_all();
 
     av_freep(&filter_nbthreads);
+
+    av_freep(&print_graphs_file);
+    av_freep(&print_graphs_format);
 
     av_freep(&input_files);
     av_freep(&output_files);
@@ -392,6 +414,7 @@ static void frame_data_free(void *opaque, uint8_t *data)
 {
     FrameData *fd = (FrameData *)data;
 
+    av_frame_side_data_free(&fd->side_data, &fd->nb_side_data);
     avcodec_parameters_free(&fd->par_enc);
 
     av_free(data);
@@ -421,6 +444,8 @@ static int frame_data_ensure(AVBufferRef **dst, int writable)
 
             memcpy(fd, fd_src, sizeof(*fd));
             fd->par_enc = NULL;
+            fd->side_data = NULL;
+            fd->nb_side_data = 0;
 
             if (fd_src->par_enc) {
                 int ret = 0;
@@ -429,6 +454,16 @@ static int frame_data_ensure(AVBufferRef **dst, int writable)
                 ret = fd->par_enc ?
                       avcodec_parameters_copy(fd->par_enc, fd_src->par_enc) :
                       AVERROR(ENOMEM);
+                if (ret < 0) {
+                    av_buffer_unref(dst);
+                    av_buffer_unref(&src);
+                    return ret;
+                }
+            }
+
+            if (fd_src->nb_side_data) {
+                int ret = clone_side_data(&fd->side_data, &fd->nb_side_data,
+                                          fd_src->side_data, fd_src->nb_side_data, 0);
                 if (ret < 0) {
                     av_buffer_unref(dst);
                     av_buffer_unref(&src);
@@ -473,21 +508,51 @@ const FrameData *packet_data_c(AVPacket *pkt)
     return ret < 0 ? NULL : (const FrameData*)pkt->opaque_ref->data;
 }
 
-void remove_avoptions(AVDictionary **a, AVDictionary *b)
+int check_avoptions_used(const AVDictionary *opts, const AVDictionary *opts_used,
+                         void *logctx, int decode)
 {
-    const AVDictionaryEntry *t = NULL;
+    const AVClass  *class = avcodec_get_class();
+    const AVClass *fclass = avformat_get_class();
 
-    while ((t = av_dict_iterate(b, t))) {
-        av_dict_set(a, t->key, NULL, AV_DICT_MATCH_CASE);
-    }
-}
+    const int flag = decode ? AV_OPT_FLAG_DECODING_PARAM :
+                              AV_OPT_FLAG_ENCODING_PARAM;
+    const AVDictionaryEntry *e = NULL;
 
-int check_avoptions(AVDictionary *m)
-{
-    const AVDictionaryEntry *t;
-    if ((t = av_dict_get(m, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
-        av_log(NULL, AV_LOG_FATAL, "Option %s not found.\n", t->key);
-        return AVERROR_OPTION_NOT_FOUND;
+    while ((e = av_dict_iterate(opts, e))) {
+        const AVOption *option, *foption;
+        char *optname, *p;
+
+        if (av_dict_get(opts_used, e->key, NULL, 0))
+            continue;
+
+        optname = av_strdup(e->key);
+        if (!optname)
+            return AVERROR(ENOMEM);
+
+        p = strchr(optname, ':');
+        if (p)
+            *p = 0;
+
+        option = av_opt_find(&class, optname, NULL, 0,
+                             AV_OPT_SEARCH_CHILDREN | AV_OPT_SEARCH_FAKE_OBJ);
+        foption = av_opt_find(&fclass, optname, NULL, 0,
+                              AV_OPT_SEARCH_CHILDREN | AV_OPT_SEARCH_FAKE_OBJ);
+        av_freep(&optname);
+        if (!option || foption)
+            continue;
+
+        if (!(option->flags & flag)) {
+            av_log(logctx, AV_LOG_ERROR, "Codec AVOption %s (%s) is not a %s "
+                   "option.\n", e->key, option->help ? option->help : "",
+                   decode ? "decoding" : "encoding");
+            return AVERROR(EINVAL);
+        }
+
+        av_log(logctx, AV_LOG_WARNING, "Codec AVOption %s (%s) has not been used "
+               "for any stream. The most likely reason is either wrong type "
+               "(e.g. a video option with no video streams) or that it is a "
+               "private option of some decoder which was not actually used "
+               "for any stream.\n", e->key, option->help ? option->help : "");
     }
 
     return 0;
@@ -524,7 +589,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     static int64_t last_time = -1;
     static int first_report = 1;
     uint64_t nb_frames_dup = 0, nb_frames_drop = 0;
-    int mins, secs, us;
+    int mins, secs, ms, us;
     int64_t hours;
     const char *hours_sign;
     int ret;
@@ -548,6 +613,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     vid = 0;
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprint_init(&buf_script, 0, AV_BPRINT_SIZE_AUTOMATIC);
+
     for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
         const float q = ost->enc ? atomic_load(&ost->quality) / (float) FF_QP2LAMBDA : -1;
 
@@ -556,7 +622,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
                        ost->file->index, ost->index, q);
         }
-        if (!vid && ost->type == AVMEDIA_TYPE_VIDEO && ost->filter) {
+        if (!vid && ost->type == AVMEDIA_TYPE_VIDEO) {
             float fps;
             uint64_t frame_number = atomic_load(&ost->packets_written);
 
@@ -570,8 +636,10 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
             if (is_last_report)
                 av_bprintf(&buf, "L");
 
-            nb_frames_dup  = atomic_load(&ost->filter->nb_frames_dup);
-            nb_frames_drop = atomic_load(&ost->filter->nb_frames_drop);
+            if (ost->filter) {
+                nb_frames_dup  = atomic_load(&ost->filter->nb_frames_dup);
+                nb_frames_drop = atomic_load(&ost->filter->nb_frames_drop);
+            }
 
             vid = 1;
         }
@@ -636,6 +704,15 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         av_bprintf(&buf_script, "speed=%4.3gx\n", speed);
     }
 
+    secs = (int)t;
+    ms = (int)((t - secs) * 1000);
+    mins = secs / 60;
+    secs %= 60;
+    hours = mins / 60;
+    mins %= 60;
+
+    av_bprintf(&buf, " elapsed=%"PRId64":%02d:%02d.%02d", hours, mins, secs, ms / 10);
+
     if (print_stats || is_last_report) {
         const char end = is_last_report ? '\n' : '\r';
         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
@@ -695,7 +772,7 @@ static void print_stream_maps(void)
                 av_log(NULL, AV_LOG_INFO, " (graph %d)", ost->filter->graph->index);
 
             av_log(NULL, AV_LOG_INFO, " -> Stream #%d:%d (%s)\n", ost->file->index,
-                   ost->index, ost->enc_ctx->codec->name);
+                   ost->index, ost->enc->enc_ctx->codec->name);
             continue;
         }
 
@@ -704,9 +781,9 @@ static void print_stream_maps(void)
                ost->ist->index,
                ost->file->index,
                ost->index);
-        if (ost->enc_ctx) {
+        if (ost->enc) {
             const AVCodec *in_codec    = ost->ist->dec;
-            const AVCodec *out_codec   = ost->enc_ctx->codec;
+            const AVCodec *out_codec   = ost->enc->enc_ctx->codec;
             const char *decoder_name   = "?";
             const char *in_codec_name  = "?";
             const char *encoder_name   = "?";
@@ -756,8 +833,6 @@ static int check_keyboard_interaction(int64_t cur_time)
 {
     int i, key;
     static int64_t last_time;
-    if (received_nb_signals)
-        return AVERROR_EXIT;
     /* read_key() returns 0 on EOF */
     if (cur_time - last_time >= 100000) {
         key =  read_key();
@@ -840,6 +915,9 @@ static int transcode(Scheduler *sch)
 
     while (!sch_wait(sch, stats_period, &transcode_ts)) {
         int64_t cur_time= av_gettime_relative();
+
+        if (received_nb_signals)
+            break;
 
         /* if 'q' pressed, exits */
         if (stdin_interaction)
@@ -955,6 +1033,10 @@ int main(int argc, char **argv)
         goto finish;
     }
 
+#if CONFIG_MEDIACODEC
+    android_binder_threadpool_init_if_required();
+#endif
+
     current_time = ti = get_benchmark_time_stamps();
     ret = transcode(sch);
     if (ret >= 0 && do_benchmark) {
@@ -978,6 +1060,9 @@ finish:
     ffmpeg_cleanup(ret);
 
     sch_free(&sch);
+
+    av_log(NULL, AV_LOG_VERBOSE, "\n");
+    av_log(NULL, AV_LOG_VERBOSE, "Exiting with exit code %d\n", ret);
 
     return ret;
 }

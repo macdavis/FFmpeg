@@ -37,6 +37,9 @@ const AVMetadataConv ff_asf_metadata_conv[] = {
     { "WM/Language",             "language"         },
     { "WM/OriginalFilename",     "filename"         },
     { "WM/PartOfSet",            "disc"             },
+    /* SetSubTitle can be found in this mapping:
+     * https://learn.microsoft.com/en-gb/windows/win32/wmformat/id3-tag-support */
+    { "WM/SetSubTitle",          "disc_subtitle"    },
     { "WM/Publisher",            "publisher"        },
     { "WM/Tool",                 "encoder"          },
     { "WM/TrackNumber",          "track"            },
@@ -90,8 +93,8 @@ static int asf_read_picture(AVFormatContext *s, int len)
         return 0;
     }
 
-    if (picsize >= len) {
-        av_log(s, AV_LOG_ERROR, "Invalid attached picture data size: %d >= %d.\n",
+    if (picsize >= len || ((int64_t)len - picsize) * 2 + 1 > INT_MAX) {
+        av_log(s, AV_LOG_ERROR, "Invalid attached picture data size: %d  (len = %d).\n",
                picsize, len);
         return AVERROR_INVALIDDATA;
     }

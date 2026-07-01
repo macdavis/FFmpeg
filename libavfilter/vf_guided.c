@@ -25,7 +25,6 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "framesync.h"
-#include "internal.h"
 #include "video.h"
 
 enum FilterModes {
@@ -114,8 +113,8 @@ static int box_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
     const int height = t->height;
     const int src_stride = t->srcStride;
     const int dst_stride = t->dstStride;
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end   = (height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const int radius = s->radius;
     const float *src = t->src;
     float *dst = t->dst;
@@ -337,6 +336,8 @@ static int config_output(AVFilterLink *outlink)
     AVFilterContext *ctx = outlink->src;
     GuidedContext *s = ctx->priv;
     AVFilterLink *mainlink = ctx->inputs[0];
+    FilterLink         *il = ff_filter_link(mainlink);
+    FilterLink         *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int w, h, ret;
 
@@ -352,7 +353,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->h = h = mainlink->h;
     outlink->time_base = mainlink->time_base;
     outlink->sample_aspect_ratio = mainlink->sample_aspect_ratio;
-    outlink->frame_rate = mainlink->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     s->I      = av_calloc(w * h, sizeof(*s->I));
     s->II     = av_calloc(w * h, sizeof(*s->II));
@@ -485,18 +486,18 @@ static const AVFilterPad guided_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_guided = {
-    .name            = "guided",
-    .description     = NULL_IF_CONFIG_SMALL("Apply Guided filter."),
+const FFFilter ff_vf_guided = {
+    .p.name          = "guided",
+    .p.description   = NULL_IF_CONFIG_SMALL("Apply Guided filter."),
+    .p.priv_class    = &guided_class,
+    .p.inputs        = NULL,
+    .p.flags         = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS |
+                       AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .init            = init,
     .uninit          = uninit,
     .priv_size       = sizeof(GuidedContext),
-    .priv_class      = &guided_class,
     .activate        = activate,
-    .inputs          = NULL,
     FILTER_OUTPUTS(guided_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags           = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS |
-                       AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .process_command = ff_filter_process_command,
 };

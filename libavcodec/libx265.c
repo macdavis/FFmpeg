@@ -38,9 +38,16 @@
 #include "codec_internal.h"
 #include "dovi_rpu.h"
 #include "encode.h"
-#include "packet_internal.h"
 #include "atsc_a53.h"
 #include "sei.h"
+
+#if defined(X265_ENABLE_ALPHA) && MAX_LAYERS > 2
+#define FF_X265_MAX_LAYERS MAX_LAYERS
+#elif X265_BUILD >= 210
+#define FF_X265_MAX_LAYERS 2
+#else
+#define FF_X265_MAX_LAYERS 1
+#endif
 
 typedef struct ReorderedData {
     int64_t duration;
@@ -64,6 +71,7 @@ typedef struct libx265Context {
     char *preset;
     char *tune;
     char *profile;
+    char *stats;
     AVDictionary *x265_opts;
 
     void *sei_data;
@@ -243,6 +251,24 @@ static int handle_side_data(AVCodecContext *avctx, const x265_api *api,
     return 0;
 }
 
+static int get_x265_log_level(AVCodecContext *avctx)
+{
+    int level = av_log_get_level() + avctx->log_level_offset;
+
+    if (level <= AV_LOG_QUIET)
+        return X265_LOG_NONE;
+    if (level <= AV_LOG_ERROR)
+        return X265_LOG_ERROR;
+    if (level <= AV_LOG_WARNING)
+        return X265_LOG_WARNING;
+    if (level <= AV_LOG_INFO)
+        return X265_LOG_INFO;
+    if (level <= AV_LOG_DEBUG)
+        return X265_LOG_DEBUG;
+
+    return X265_LOG_FULL;
+}
+
 static av_cold int libx265_encode_init(AVCodecContext *avctx)
 {
     libx265Context *ctx = avctx->priv_data;
@@ -278,19 +304,14 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
         return AVERROR(EINVAL);
     }
 
+    ctx->params->logLevel = get_x265_log_level(avctx);
     ctx->params->frameNumThreads = avctx->thread_count;
     if (avctx->framerate.num > 0 && avctx->framerate.den > 0) {
         ctx->params->fpsNum      = avctx->framerate.num;
         ctx->params->fpsDenom    = avctx->framerate.den;
     } else {
         ctx->params->fpsNum      = avctx->time_base.den;
-FF_DISABLE_DEPRECATION_WARNINGS
-        ctx->params->fpsDenom    = avctx->time_base.num
-#if FF_API_TICKS_PER_FRAME
-                                   * avctx->ticks_per_frame
-#endif
-                                   ;
-FF_ENABLE_DEPRECATION_WARNINGS
+        ctx->params->fpsDenom    = avctx->time_base.num;
     }
     ctx->params->sourceWidth     = avctx->width;
     ctx->params->sourceHeight    = avctx->height;
@@ -495,10 +516,24 @@ FF_ENABLE_DEPRECATION_WARNINGS
     }
 
     {
-        AVDictionaryEntry *en = NULL;
-        while ((en = av_dict_get(ctx->x265_opts, "", en, AV_DICT_IGNORE_SUFFIX))) {
-            int parse_ret = ctx->api->param_parse(ctx->params, en->key, en->value);
+        const AVDictionaryEntry *en = NULL;
+        while ((en = av_dict_iterate(ctx->x265_opts, en))) {
+            int parse_ret;
 
+            // ignore forced alpha option. The pixel format is all we need.
+            if (!strncmp(en->key, "alpha", 5)) {
+                if (desc->nb_components == 4) {
+                    av_log(avctx, AV_LOG_WARNING,
+                           "Ignoring redundant \"alpha\" option.\n");
+                    continue;
+                }
+                av_log(avctx, AV_LOG_ERROR,
+                       "Alpha encoding was requested through an unsupported "
+                       "option when no alpha plane is present\n");
+                return AVERROR(EINVAL);
+            }
+
+            parse_ret = ctx->api->param_parse(ctx->params, en->key, en->value);
             switch (parse_ret) {
             case X265_PARAM_BAD_NAME:
                 av_log(avctx, AV_LOG_WARNING,
@@ -511,6 +546,24 @@ FF_ENABLE_DEPRECATION_WARNINGS
             default:
                 break;
             }
+        }
+    }
+
+    if (avctx->flags & AV_CODEC_FLAG_PASS1) {
+        if (ctx->api->param_parse(ctx->params, "pass", "1") == X265_PARAM_BAD_VALUE) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid value for param \"pass\".\n");
+            return AVERROR(EINVAL);
+        }
+    } else if (avctx->flags & AV_CODEC_FLAG_PASS2) {
+        if (ctx->api->param_parse(ctx->params, "pass", "2") == X265_PARAM_BAD_VALUE) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid value for param \"pass\".\n");
+            return AVERROR(EINVAL);
+        }
+    }
+    if (ctx->stats) {
+        if (ctx->api->param_parse(ctx->params, "stats", ctx->stats) == X265_PARAM_BAD_VALUE) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid value \"%s\" for param \"stats\".\n", ctx->stats);
+            return AVERROR(EINVAL);
         }
     }
 
@@ -537,6 +590,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
         return ret;
     ctx->params->dolbyProfile = ctx->dovi.cfg.dv_profile * 10 +
                                 ctx->dovi.cfg.dv_bl_signal_compatibility_id;
+#endif
+
+#if X265_BUILD >= 210 && FF_X265_MAX_LAYERS > 1
+    if (desc->flags & AV_PIX_FMT_FLAG_ALPHA) {
+        if (ctx->api->param_parse(ctx->params, "alpha", "1") < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Loaded libx265 does not support alpha layer encoding.\n");
+            return AVERROR(ENOTSUP);
+        }
+    }
 #endif
 
     ctx->encoder = ctx->api->encoder_open(ctx->params);
@@ -659,13 +721,16 @@ static void free_picture(libx265Context *ctx, x265_picture *pic)
 static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                                 const AVFrame *pic, int *got_packet)
 {
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
     libx265Context *ctx = avctx->priv_data;
     x265_picture x265pic;
-    x265_picture x265pic_out = { 0 };
+    x265_picture x265pic_out[FF_X265_MAX_LAYERS] = { 0 };
+#if (X265_BUILD >= 210) && (X265_BUILD < 213)
+    x265_picture *x265pic_lyrptr_out[FF_X265_MAX_LAYERS];
+#endif
     x265_nal *nal;
     x265_sei *sei;
     uint8_t *dst;
-    int pict_type;
     int payload = 0;
     int nnal;
     int ret;
@@ -681,7 +746,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         ReorderedData *rd;
         int rd_idx;
 
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < desc->nb_components; i++) {
            x265pic.planes[i] = pic->data[i];
            x265pic.stride[i] = pic->linesize[i];
         }
@@ -743,7 +808,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 sei_payload = &sei->payloads[sei->numPayloads];
                 sei_payload->payload = sei_data;
                 sei_payload->payloadSize = sei_size;
-                sei_payload->payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+                sei_payload->payloadType = (SEIPayloadType)SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
                 sei->numPayloads++;
             }
         }
@@ -774,7 +839,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 }
                 sei_payload->payloadSize = side_data->size;
                 /* Equal to libx265 USER_DATA_UNREGISTERED */
-                sei_payload->payloadType = SEI_TYPE_USER_DATA_UNREGISTERED;
+                sei_payload->payloadType = (SEIPayloadType)SEI_TYPE_USER_DATA_UNREGISTERED;
                 sei->numPayloads++;
             }
         }
@@ -783,7 +848,8 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         sd = av_frame_get_side_data(pic, AV_FRAME_DATA_DOVI_METADATA);
         if (ctx->dovi.cfg.dv_profile && sd) {
             const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->data;
-            ret = ff_dovi_rpu_generate(&ctx->dovi, metadata, &x265pic.rpu.payload,
+            ret = ff_dovi_rpu_generate(&ctx->dovi, metadata, FF_DOVI_WRAP_NAL,
+                                       &x265pic.rpu.payload,
                                        &x265pic.rpu.payloadSize);
             if (ret < 0) {
                 free_picture(ctx, &x265pic);
@@ -798,8 +864,16 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 #endif
     }
 
+#if (X265_BUILD >= 210) && (X265_BUILD < 213)
+    for (i = 0; i < FF_ARRAY_ELEMS(x265pic_out); i++)
+        x265pic_lyrptr_out[i] = &x265pic_out[i];
+
     ret = ctx->api->encoder_encode(ctx->encoder, &nal, &nnal,
-                                   pic ? &x265pic : NULL, &x265pic_out);
+                                   pic ? &x265pic : NULL, x265pic_lyrptr_out);
+#else
+    ret = ctx->api->encoder_encode(ctx->encoder, &nal, &nnal,
+                                   pic ? &x265pic : NULL, x265pic_out);
+#endif
 
     for (i = 0; i < sei->numPayloads; i++)
         av_free(sei->payloads[i].payload);
@@ -829,10 +903,11 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             pkt->flags |= AV_PKT_FLAG_KEY;
     }
 
-    pkt->pts = x265pic_out.pts;
-    pkt->dts = x265pic_out.dts;
+    pkt->pts = x265pic_out->pts;
+    pkt->dts = x265pic_out->dts;
 
-    switch (x265pic_out.sliceType) {
+    enum AVPictureType pict_type;
+    switch (x265pic_out->sliceType) {
     case X265_TYPE_IDR:
     case X265_TYPE_I:
         pict_type = AV_PICTURE_TYPE_I;
@@ -850,16 +925,16 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
 #if X265_BUILD >= 130
-    if (x265pic_out.sliceType == X265_TYPE_B)
+    if (x265pic_out->sliceType == X265_TYPE_B)
 #else
-    if (x265pic_out.frameData.sliceType == 'b')
+    if (x265pic_out->frameData.sliceType == 'b')
 #endif
         pkt->flags |= AV_PKT_FLAG_DISPOSABLE;
 
-    ff_side_data_set_encoder_stats(pkt, x265pic_out.frameData.qp * FF_QP2LAMBDA, NULL, 0, pict_type);
+    ff_encode_add_stats_side_data(pkt, x265pic_out->frameData.qp * FF_QP2LAMBDA, NULL, 0, pict_type);
 
-    if (x265pic_out.userData) {
-        int idx = (int)(intptr_t)x265pic_out.userData - 1;
+    if (x265pic_out->userData) {
+        int idx = (int)(intptr_t)x265pic_out->userData - 1;
         ReorderedData *rd = &ctx->rd[idx];
 
         pkt->duration           = rd->duration;
@@ -886,6 +961,9 @@ static const enum AVPixelFormat x265_csp_eight[] = {
     AV_PIX_FMT_YUVJ444P,
     AV_PIX_FMT_GBRP,
     AV_PIX_FMT_GRAY8,
+#if X265_BUILD >= 210 && FF_X265_MAX_LAYERS > 1
+    AV_PIX_FMT_YUVA420P,
+#endif
     AV_PIX_FMT_NONE
 };
 
@@ -903,6 +981,10 @@ static const enum AVPixelFormat x265_csp_ten[] = {
     AV_PIX_FMT_GBRP10,
     AV_PIX_FMT_GRAY8,
     AV_PIX_FMT_GRAY10,
+#if X265_BUILD >= 210 && FF_X265_MAX_LAYERS > 1
+    AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUVA420P10,
+#endif
     AV_PIX_FMT_NONE
 };
 
@@ -925,17 +1007,35 @@ static const enum AVPixelFormat x265_csp_twelve[] = {
     AV_PIX_FMT_GRAY8,
     AV_PIX_FMT_GRAY10,
     AV_PIX_FMT_GRAY12,
+#if X265_BUILD >= 210 && FF_X265_MAX_LAYERS > 1
+    AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUVA420P10,
+#endif
     AV_PIX_FMT_NONE
 };
 
-static av_cold void libx265_encode_init_csp(FFCodec *codec)
+static int libx265_get_supported_config(const AVCodecContext *avctx,
+                                        const AVCodec *codec,
+                                        enum AVCodecConfig config,
+                                        unsigned flags, const void **out,
+                                        int *out_num)
 {
-    if (x265_api_get(12))
-        codec->p.pix_fmts = x265_csp_twelve;
-    else if (x265_api_get(10))
-        codec->p.pix_fmts = x265_csp_ten;
-    else if (x265_api_get(8))
-        codec->p.pix_fmts = x265_csp_eight;
+    if (config == AV_CODEC_CONFIG_PIX_FORMAT) {
+        if (x265_api_get(12)) {
+            *out = x265_csp_twelve;
+            *out_num = FF_ARRAY_ELEMS(x265_csp_twelve) - 1;
+        } else if (x265_api_get(10)) {
+            *out = x265_csp_ten;
+            *out_num = FF_ARRAY_ELEMS(x265_csp_ten) - 1;
+        } else if (x265_api_get(8)) {
+            *out = x265_csp_eight;
+            *out_num = FF_ARRAY_ELEMS(x265_csp_eight) - 1;
+        } else
+            return AVERROR_EXTERNAL;
+        return 0;
+    }
+
+    return ff_default_get_supported_config(avctx, codec, config, flags, out, out_num);
 }
 
 #define OFFSET(x) offsetof(libx265Context, x)
@@ -947,8 +1047,9 @@ static const AVOption options[] = {
     { "preset",      "set the x265 preset",                                                         OFFSET(preset),    AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
     { "tune",        "set the x265 tune parameter",                                                 OFFSET(tune),      AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
     { "profile",     "set the x265 profile",                                                        OFFSET(profile),   AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
+    { "x265-stats",  "Filename for 2 pass stats",                                                   OFFSET(stats),     AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
     { "udu_sei",     "Use user data unregistered SEI if available",                                 OFFSET(udu_sei),   AV_OPT_TYPE_BOOL,   { .i64 = 0 }, 0, 1, VE },
-    { "a53cc",       "Use A53 Closed Captions (if available)",                                      OFFSET(a53_cc),    AV_OPT_TYPE_BOOL,   { .i64 = 1 }, 0, 1, VE },
+    { "a53cc",       "Use A53 Closed Captions (if available)",                                      OFFSET(a53_cc),    AV_OPT_TYPE_BOOL,   { .i64 = 0 }, 0, 1, VE },
     { "x265-params", "set the x265 configuration using a :-separated list of key=value parameters", OFFSET(x265_opts), AV_OPT_TYPE_DICT,   { 0 }, 0, 0, VE },
 #if X265_BUILD >= 167
     { "dolbyvision", "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
@@ -980,7 +1081,7 @@ static const FFCodecDefault x265_defaults[] = {
     { NULL },
 };
 
-FFCodec ff_libx265_encoder = {
+const FFCodec ff_libx265_encoder = {
     .p.name           = "libx265",
     CODEC_LONG_NAME("libx265 H.265 / HEVC"),
     .p.type           = AVMEDIA_TYPE_VIDEO,
@@ -988,10 +1089,11 @@ FFCodec ff_libx265_encoder = {
     .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
                         AV_CODEC_CAP_OTHER_THREADS |
                         AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    .color_ranges     = AVCOL_RANGE_MPEG | AVCOL_RANGE_JPEG,
     .p.priv_class     = &class,
     .p.wrapper_name   = "libx265",
     .init             = libx265_encode_init,
-    .init_static_data = libx265_encode_init_csp,
+    .get_supported_config = libx265_get_supported_config,
     FF_CODEC_ENCODE_CB(libx265_encode_frame),
     .close            = libx265_encode_close,
     .priv_data_size   = sizeof(libx265Context),

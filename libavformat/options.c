@@ -18,6 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "avformat.h"
+#include "avformat_internal.h"
 #include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
@@ -25,6 +26,7 @@
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec_par.h"
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/iamf.h"
 #include "libavutil/internal.h"
@@ -44,7 +46,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
 static const char* format_to_name(void* ptr)
 {
     AVFormatContext* fc = (AVFormatContext*) ptr;
-    if(fc->iformat) return fc->iformat->name;
+    if (fc->name) return fc->name;
+    else if(fc->iformat) return fc->iformat->name;
     else if(fc->oformat) return fc->oformat->name;
     else return fc->av_class->class_name;
 }
@@ -160,12 +163,15 @@ static int io_close2_default(AVFormatContext *s, AVIOContext *pb)
 
 AVFormatContext *avformat_alloc_context(void)
 {
-    FFFormatContext *const si = av_mallocz(sizeof(*si));
+    FormatContextInternal *fci;
+    FFFormatContext *si;
     AVFormatContext *s;
 
-    if (!si)
+    fci = av_mallocz(sizeof(*fci));
+    if (!fci)
         return NULL;
 
+    si = &fci->fc;
     s = &si->pub;
     s->av_class = &av_format_context_class;
     s->io_open  = io_open_default;
@@ -180,19 +186,8 @@ AVFormatContext *avformat_alloc_context(void)
         return NULL;
     }
 
-#if FF_API_LAVF_SHORTEST
-    si->shortest_end = AV_NOPTS_VALUE;
-#endif
-
     return s;
 }
-
-#if FF_API_GET_DUR_ESTIMATE_METHOD
-enum AVDurationEstimationMethod av_fmt_ctx_get_duration_estimation_method(const AVFormatContext* ctx)
-{
-    return ctx->duration_estimation_method;
-}
-#endif
 
 const AVClass *avformat_get_class(void)
 {
@@ -219,7 +214,8 @@ const AVClass *avformat_get_class(void)
         { "descriptions",       .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DESCRIPTIONS      },    .unit = "disposition" }, \
         { "metadata",           .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_METADATA          },    .unit = "disposition" }, \
         { "dependent",          .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DEPENDENT         },    .unit = "disposition" }, \
-        { "still_image",        .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_STILL_IMAGE       },    .unit = "disposition" }
+        { "still_image",        .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_STILL_IMAGE       },    .unit = "disposition" }, \
+        { "multilayer",         .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_MULTILAYER        },    .unit = "disposition" }
 
 static const AVOption stream_options[] = {
     DISPOSITION_OPT(AVStream),
@@ -249,7 +245,6 @@ const AVClass *av_stream_get_class(void)
 
 AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
 {
-    FFFormatContext *const si = ffformatcontext(s);
     FFStream *sti;
     AVStream *st;
     AVStream **streams;
@@ -276,6 +271,10 @@ AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
         goto fail;
 
     sti->fmtctx = s;
+
+    sti->parse_pkt = av_packet_alloc();
+    if (!sti->parse_pkt)
+        goto fail;
 
     if (s->iformat) {
         sti->avctx = avcodec_alloc_context3(NULL);
@@ -317,11 +316,6 @@ AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
         sti->pts_buffer[i] = AV_NOPTS_VALUE;
 
     st->sample_aspect_ratio = (AVRational) { 0, 1 };
-    sti->transferred_mux_tb = (AVRational) { 0, 1 };;
-
-#if FF_API_AVSTREAM_SIDE_DATA
-    sti->inject_global_side_data = si->inject_global_side_data;
-#endif
 
     sti->need_context_update = 1;
 
@@ -345,13 +339,52 @@ static const AVOption tile_grid_options[] = {
     { "vertical_offset",   NULL, OFFSET(vertical_offset),   AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
     { NULL },
 };
-#undef FLAGS
 #undef OFFSET
 
 static const AVClass tile_grid_class = {
     .class_name = "AVStreamGroupTileGrid",
     .version    = LIBAVUTIL_VERSION_INT,
     .option     = tile_grid_options,
+};
+
+#define OFFSET(x) offsetof(AVStreamGroupTREF, x)
+static const AVOption tref_options[] = {
+    { "metadata_index", "Index of the data stream within the group", OFFSET(metadata_index),
+        AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, UINT_MAX, FLAGS },
+    { NULL },
+};
+#undef OFFSET
+
+static const AVClass tref_class = {
+    .class_name = "AVStreamGroupTREF",
+    .version    = LIBAVUTIL_VERSION_INT,
+    .option     = tref_options,
+};
+
+#if FF_API_LCEVC_STRUCT
+FF_DISABLE_DEPRECATION_WARNINGS
+#endif
+#define OFFSET(x) offsetof(AVStreamGroupLayeredVideo, x)
+static const AVOption layered_video_options[] = {
+#if FF_API_LCEVC_STRUCT
+    { "lcevc_index", "Index of the LCEVC stream within the group", OFFSET(lcevc_index),
+        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS | AV_OPT_FLAG_DEPRECATED },
+#endif
+    { "el_index", "Index of the enhancement layer stream within the group", OFFSET(el_index),
+        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
+    { "video_size", "size of the final layered video presentation", OFFSET(width),
+        AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX, FLAGS },
+    { NULL },
+};
+#if FF_API_LCEVC_STRUCT
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+#undef OFFSET
+
+static const AVClass layered_video_class = {
+    .class_name = "AVStreamGroupLayeredVideo",
+    .version    = LIBAVUTIL_VERSION_INT,
+    .option     = layered_video_options,
 };
 
 static void *stream_group_child_next(void *obj, void *prev)
@@ -365,12 +398,19 @@ static void *stream_group_child_next(void *obj, void *prev)
             return stg->params.iamf_mix_presentation;
         case AV_STREAM_GROUP_PARAMS_TILE_GRID:
             return stg->params.tile_grid;
+        case AV_STREAM_GROUP_PARAMS_TREF:
+            return stg->params.tref;
+        case AV_STREAM_GROUP_PARAMS_LCEVC:
+        case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
+            return stg->params.layered_video;
         default:
             break;
         }
     }
     return NULL;
 }
+
+#undef FLAGS
 
 static const AVClass *stream_group_child_iterate(void **opaque)
 {
@@ -380,7 +420,7 @@ static const AVClass *stream_group_child_iterate(void **opaque)
     switch(i) {
     case AV_STREAM_GROUP_PARAMS_NONE:
         i++;
-    // fall-through
+        av_fallthrough;
     case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
         ret = av_iamf_audio_element_get_class();
         break;
@@ -389,6 +429,13 @@ static const AVClass *stream_group_child_iterate(void **opaque)
         break;
     case AV_STREAM_GROUP_PARAMS_TILE_GRID:
         ret = &tile_grid_class;
+        break;
+    case AV_STREAM_GROUP_PARAMS_TREF:
+        ret = &tref_class;
+        break;
+    case AV_STREAM_GROUP_PARAMS_LCEVC:
+    case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
+        ret = &layered_video_class;
         break;
     default:
         break;
@@ -458,6 +505,21 @@ AVStreamGroup *avformat_stream_group_create(AVFormatContext *s,
             goto fail;
         stg->params.tile_grid->av_class = &tile_grid_class;
         av_opt_set_defaults(stg->params.tile_grid);
+        break;
+    case AV_STREAM_GROUP_PARAMS_TREF:
+        stg->params.tref = av_mallocz(sizeof(*stg->params.tref));
+        if (!stg->params.tref)
+            goto fail;
+        stg->params.tref->av_class = &tref_class;
+        av_opt_set_defaults(stg->params.tref);
+        break;
+    case AV_STREAM_GROUP_PARAMS_LCEVC:
+    case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
+        stg->params.layered_video = av_mallocz(sizeof(*stg->params.layered_video));
+        if (!stg->params.layered_video)
+            goto fail;
+        stg->params.layered_video->av_class = &layered_video_class;
+        av_opt_set_defaults(stg->params.layered_video);
         break;
     default:
         goto fail;

@@ -22,6 +22,7 @@
 
 #include <string.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "libavutil/cuda_check.h"
 #include "libavutil/hwcontext.h"
@@ -31,7 +32,7 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 #include "cuda/load_helper.h"
 
@@ -61,7 +62,8 @@ typedef struct CUDAColorspaceContext {
     CUfunction cu_convert[AVCOL_RANGE_NB];
 
     enum AVPixelFormat pix_fmt;
-    enum AVColorRange range;
+    /* enum AVColorRange */
+    int range;
 
     int num_planes;
 } CUDAColorspaceContext;
@@ -151,17 +153,19 @@ static int format_is_supported(enum AVPixelFormat fmt)
 static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
                                          int height)
 {
+    FilterLink          *inl = ff_filter_link(ctx->inputs[0]);
+    FilterLink         *outl = ff_filter_link(ctx->outputs[0]);
     CUDAColorspaceContext* s = ctx->priv;
     AVHWFramesContext* in_frames_ctx;
 
     int ret;
 
-    if (!ctx->inputs[0]->hw_frames_ctx) {
+    if (!inl->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw context provided on input\n");
         return AVERROR(EINVAL);
     }
 
-    in_frames_ctx = (AVHWFramesContext*)ctx->inputs[0]->hw_frames_ctx->data;
+    in_frames_ctx = (AVHWFramesContext*)inl->hw_frames_ctx->data;
     s->pix_fmt = in_frames_ctx->sw_format;
 
     if (!format_is_supported(s->pix_fmt)) {
@@ -181,8 +185,8 @@ static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
     if (ret < 0)
         return ret;
 
-    ctx->outputs[0]->hw_frames_ctx = av_buffer_ref(s->frames_ctx);
-    if (!ctx->outputs[0]->hw_frames_ctx)
+    outl->hw_frames_ctx = av_buffer_ref(s->frames_ctx);
+    if (!outl->hw_frames_ctx)
         return AVERROR(ENOMEM);
 
     return 0;
@@ -225,14 +229,11 @@ static av_cold int cudacolorspace_config_props(AVFilterLink* outlink)
 {
     AVFilterContext* ctx = outlink->src;
     AVFilterLink* inlink = outlink->src->inputs[0];
+    FilterLink      *inl = ff_filter_link(inlink);
     CUDAColorspaceContext* s = ctx->priv;
-    AVHWFramesContext* frames_ctx =
-        (AVHWFramesContext*)inlink->hw_frames_ctx->data;
-    AVCUDADeviceContext* device_hwctx = frames_ctx->device_ctx->hwctx;
+    AVHWFramesContext* frames_ctx;
+    AVCUDADeviceContext* device_hwctx;
     int ret;
-
-    s->hwctx = device_hwctx;
-    s->cu_stream = s->hwctx->stream;
 
     outlink->w = inlink->w;
     outlink->h = inlink->h;
@@ -240,6 +241,12 @@ static av_cold int cudacolorspace_config_props(AVFilterLink* outlink)
     ret = init_processing_chain(ctx, inlink->w, inlink->h);
     if (ret < 0)
         return ret;
+
+    frames_ctx = (AVHWFramesContext*)inl->hw_frames_ctx->data;
+    device_hwctx = frames_ctx->device_ctx->hwctx;
+
+    s->hwctx = device_hwctx;
+    s->cu_stream = s->hwctx->stream;
 
     if (inlink->sample_aspect_ratio.num) {
         outlink->sample_aspect_ratio = av_mul_q(
@@ -277,7 +284,7 @@ static int conv_cuda_convert(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
             break;
         case AV_PIX_FMT_YUV420P:
             width = comp_id ? in->width / 2 : in->width;
-            /* fall-through */
+            av_fallthrough;
         case AV_PIX_FMT_NV12:
             height = comp_id ? in->height / 2 : in->height;
             break;
@@ -413,15 +420,16 @@ static const AVFilterPad cudacolorspace_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_colorspace_cuda = {
-    .name = "colorspace_cuda",
-    .description = NULL_IF_CONFIG_SMALL("CUDA accelerated video color converter"),
+const FFFilter ff_vf_colorspace_cuda = {
+    .p.name        = "colorspace_cuda",
+    .p.description = NULL_IF_CONFIG_SMALL("CUDA accelerated video color converter"),
+
+    .p.priv_class  = &cudacolorspace_class,
 
     .init = cudacolorspace_init,
     .uninit = cudacolorspace_uninit,
 
     .priv_size = sizeof(CUDAColorspaceContext),
-    .priv_class = &cudacolorspace_class,
 
     FILTER_INPUTS(cudacolorspace_inputs),
     FILTER_OUTPUTS(cudacolorspace_outputs),

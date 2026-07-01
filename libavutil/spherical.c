@@ -26,11 +26,14 @@
 AVSphericalMapping *av_spherical_alloc(size_t *size)
 {
     AVSphericalMapping *spherical = av_mallocz(sizeof(AVSphericalMapping));
+
+    if (size)
+        *size = spherical ? sizeof(*spherical) : 0;
+
     if (!spherical)
         return NULL;
 
-    if (size)
-        *size = sizeof(*spherical);
+    spherical->projection = AV_SPHERICAL_RECTILINEAR;
 
     return spherical;
 }
@@ -57,6 +60,10 @@ static const char *const spherical_projection_names[] = {
     [AV_SPHERICAL_EQUIRECTANGULAR]      = "equirectangular",
     [AV_SPHERICAL_CUBEMAP]              = "cubemap",
     [AV_SPHERICAL_EQUIRECTANGULAR_TILE] = "tiled equirectangular",
+    [AV_SPHERICAL_HALF_EQUIRECTANGULAR] = "half equirectangular",
+    [AV_SPHERICAL_RECTILINEAR]          = "rectilinear",
+    [AV_SPHERICAL_FISHEYE]              = "fisheye",
+    [AV_SPHERICAL_PARAMETRIC_IMMERSIVE] = "parametric immersive",
 };
 
 const char *av_spherical_projection_name(enum AVSphericalProjection projection)

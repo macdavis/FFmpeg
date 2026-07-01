@@ -37,12 +37,10 @@
 
 #include "avcodec.h"
 #include "encode.h"
-#include "internal.h"
-#include "packet_internal.h"
 #include "qsv.h"
 #include "qsv_internal.h"
 #include "qsvenc.h"
-#include "refstruct.h"
+#include "libavutil/refstruct.h"
 
 struct profile_names {
     mfxU16 profile;
@@ -685,6 +683,8 @@ static int check_enc_param(AVCodecContext *avctx, QSVEncContext *q)
             av_log(avctx, AV_LOG_ERROR, "Selected ratecontrol mode is unsupported\n");
         if (UNMATCH(LowPower))
               av_log(avctx, AV_LOG_ERROR, "Low power mode is unsupported\n");
+        if (UNMATCH(CodecLevel))
+            av_log(avctx, AV_LOG_ERROR, "Current codec level is unsupported\n");
         if (UNMATCH(FrameInfo.FrameRateExtN) || UNMATCH(FrameInfo.FrameRateExtD))
               av_log(avctx, AV_LOG_ERROR, "Current frame rate is unsupported\n");
         if (UNMATCH(FrameInfo.PicStruct))
@@ -745,8 +745,9 @@ static int init_video_param_jpeg(AVCodecContext *avctx, QSVEncContext *q)
     if (avctx->hw_frames_ctx) {
         AVHWFramesContext *frames_ctx    = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
         AVQSVFramesContext *frames_hwctx = frames_ctx->hwctx;
-        q->param.mfx.FrameInfo.Width  = frames_hwctx->surfaces[0].Info.Width;
-        q->param.mfx.FrameInfo.Height = frames_hwctx->surfaces[0].Info.Height;
+        mfxFrameInfo *info = frames_hwctx->nb_surfaces ? &frames_hwctx->surfaces[0].Info : frames_hwctx->info;
+        q->param.mfx.FrameInfo.Width  = info->Width;
+        q->param.mfx.FrameInfo.Height = info->Height;
     }
 
     if (avctx->framerate.den > 0 && avctx->framerate.num > 0) {
@@ -869,8 +870,9 @@ static int init_video_param(AVCodecContext *avctx, QSVEncContext *q)
     if (avctx->hw_frames_ctx) {
         AVHWFramesContext *frames_ctx = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
         AVQSVFramesContext *frames_hwctx = frames_ctx->hwctx;
-        q->param.mfx.FrameInfo.Width  = frames_hwctx->surfaces[0].Info.Width;
-        q->param.mfx.FrameInfo.Height = frames_hwctx->surfaces[0].Info.Height;
+        mfxFrameInfo *info = frames_hwctx->nb_surfaces ? &frames_hwctx->surfaces[0].Info : frames_hwctx->info;
+        q->param.mfx.FrameInfo.Width  = info->Width;
+        q->param.mfx.FrameInfo.Height = info->Height;
     }
 
     if (avctx->framerate.den > 0 && avctx->framerate.num > 0) {
@@ -904,6 +906,7 @@ static int init_video_param(AVCodecContext *avctx, QSVEncContext *q)
         if (q->extbrc) {
             q->extco2.LookAheadDepth = q->look_ahead_depth;
         }
+        av_fallthrough;
 #if QSV_HAVE_VCM
     case MFX_RATECONTROL_VCM:
 #endif
@@ -949,6 +952,7 @@ static int init_video_param(AVCodecContext *avctx, QSVEncContext *q)
         break;
     case MFX_RATECONTROL_LA_ICQ:
         q->extco2.LookAheadDepth = q->look_ahead_depth;
+        av_fallthrough;
     case MFX_RATECONTROL_ICQ:
         q->param.mfx.ICQQuality  = av_clip(avctx->global_quality, 1, 51);
         break;
@@ -2055,7 +2059,7 @@ static int submit_frame(QSVEncContext *q, const AVFrame *frame,
         }
     } else {
         /* make a copy if the input is not padded as libmfx requires */
-        /* and to make allocation continious for data[0]/data[1] */
+        /* and to make allocation continuous for data[0]/data[1] */
          if ((frame->height & (q->height_align - 1) || frame->linesize[0] & (q->width_align - 1)) ||
             ((frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_P010 || frame->format == AV_PIX_FMT_P012) &&
              (frame->data[1] - frame->data[0] != frame->linesize[0] * FFALIGN(qf->frame->height, q->height_align)))) {
@@ -2480,7 +2484,7 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
 
         if (frame->pict_type == AV_PICTURE_TYPE_I) {
             enc_ctrl->FrameType = MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF;
-            if (q->forced_idr)
+            if ((frame->flags & AV_FRAME_FLAG_KEY) || q->forced_idr)
                 enc_ctrl->FrameType |= MFX_FRAMETYPE_IDR;
         }
     }
@@ -2687,7 +2691,7 @@ int ff_qsv_encode(AVCodecContext *avctx, QSVEncContext *q,
         if (avctx->codec_id == AV_CODEC_ID_H264) {
             enc_buf = qpkt.bs->ExtParam;
             enc_info = (mfxExtAVCEncodedFrameInfo *)(*enc_buf);
-            ff_side_data_set_encoder_stats(&qpkt.pkt,
+            ff_encode_add_stats_side_data(&qpkt.pkt,
                 enc_info->QP * FF_QP2LAMBDA, NULL, 0, pict_type);
             av_freep(&enc_info);
             av_freep(&enc_buf);
@@ -2714,7 +2718,7 @@ int ff_qsv_enc_close(AVCodecContext *avctx, QSVEncContext *q)
     ff_qsv_close_internal_session(&q->internal_qs);
 
     av_buffer_unref(&q->frames_ctx.hw_frames_ctx);
-    ff_refstruct_unref(&q->frames_ctx.mids);
+    av_refstruct_unref(&q->frames_ctx.mids);
 
     cur = q->work_frames;
     while (cur) {

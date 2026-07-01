@@ -24,21 +24,27 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 
-#include "bsf.h"
-#include "bsf_internal.h"
-#include "bytestream.h"
-#include "defs.h"
-#include "hevc.h"
+#include "libavcodec/bsf.h"
+#include "libavcodec/bsf_internal.h"
+#include "libavcodec/bytestream.h"
+#include "libavcodec/defs.h"
+
+#include "libavcodec/hevc/hevc.h"
 
 #define MIN_HEVCC_LENGTH 23
 
 typedef struct HEVCBSFContext {
+    uint8_t *extradata;
+    size_t   extradata_size;
     uint8_t  length_size;
     int      extradata_parsed;
 } HEVCBSFContext;
 
-static int hevc_extradata_to_annexb(AVBSFContext *ctx)
+static int hevc_extradata_to_annexb(AVBSFContext *ctx,
+                                    const uint8_t *extradata, int extradata_size,
+                                    uint8_t **out_extradata, int *out_extradata_size)
 {
+    HEVCBSFContext *s = ctx->priv_data;
     GetByteContext gb;
     int length_size, num_arrays, i, j;
     int ret = 0;
@@ -46,7 +52,7 @@ static int hevc_extradata_to_annexb(AVBSFContext *ctx)
     uint8_t *new_extradata = NULL;
     size_t   new_extradata_size = 0;
 
-    bytestream2_init(&gb, ctx->par_in->extradata, ctx->par_in->extradata_size);
+    bytestream2_init(&gb, extradata, extradata_size);
 
     bytestream2_skip(&gb, 21);
     length_size = (bytestream2_get_byte(&gb) & 3) + 1;
@@ -84,14 +90,30 @@ static int hevc_extradata_to_annexb(AVBSFContext *ctx)
         }
     }
 
-    av_freep(&ctx->par_out->extradata);
-    ctx->par_out->extradata      = new_extradata;
-    ctx->par_out->extradata_size = new_extradata_size;
-
     if (!new_extradata_size)
         av_log(ctx, AV_LOG_WARNING, "No parameter sets in the extradata\n");
 
-    return length_size;
+    if (out_extradata && out_extradata_size) {
+        av_freep(out_extradata);
+        *out_extradata =
+            av_malloc(new_extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!(*out_extradata)) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        *out_extradata_size = new_extradata_size;
+        memcpy(*out_extradata, new_extradata, new_extradata_size);
+        memset(*out_extradata + new_extradata_size, 0,
+               AV_INPUT_BUFFER_PADDING_SIZE);
+    }
+
+    av_freep(&s->extradata);
+    s->extradata = new_extradata;
+    s->extradata_size = new_extradata_size;
+
+    s->length_size = length_size;
+    s->extradata_parsed = 1;
+    return 0;
 fail:
     av_freep(&new_extradata);
     return ret;
@@ -99,7 +121,6 @@ fail:
 
 static int hevc_mp4toannexb_init(AVBSFContext *ctx)
 {
-    HEVCBSFContext *s = ctx->priv_data;
     int ret;
 
     if (ctx->par_in->extradata_size < MIN_HEVCC_LENGTH ||
@@ -108,11 +129,13 @@ static int hevc_mp4toannexb_init(AVBSFContext *ctx)
         av_log(ctx, AV_LOG_VERBOSE,
                "The input looks like it is Annex B already\n");
     } else {
-        ret = hevc_extradata_to_annexb(ctx);
+        ret = hevc_extradata_to_annexb(ctx,
+                                       ctx->par_in->extradata,
+                                       ctx->par_in->extradata_size,
+                                       &ctx->par_out->extradata,
+                                       &ctx->par_out->extradata_size);
         if (ret < 0)
             return ret;
-        s->length_size      = ret;
-        s->extradata_parsed = 1;
     }
 
     return 0;
@@ -125,11 +148,27 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
     GetByteContext gb;
 
     int got_irap = 0;
+    int got_ps = 0, seen_irap_ps = 0;
     int i, ret = 0;
+    size_t extradata_size = 0;
+    uint8_t *extradata = NULL;
 
     ret = ff_bsf_get_packet(ctx, &in);
     if (ret < 0)
         return ret;
+
+    extradata =
+        av_packet_get_side_data(in, AV_PKT_DATA_NEW_EXTRADATA, &extradata_size);
+    if (extradata && extradata_size >= MIN_HEVCC_LENGTH &&
+        ((extradata[0] == 1) ||
+         (extradata[0] == 0 && (extradata[1] || extradata[2] > 1)))) {
+        ret = hevc_extradata_to_annexb(ctx, extradata, extradata_size,
+                                       NULL, NULL);
+        if (ret < 0)
+            goto fail;
+        av_packet_side_data_remove(in->side_data, &in->side_data_elems,
+                                   AV_PKT_DATA_NEW_EXTRADATA);
+    }
 
     if (!s->extradata_parsed) {
         av_packet_move_ref(out, in);
@@ -139,10 +178,37 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
 
     bytestream2_init(&gb, in->data, in->size);
 
+    while (!got_irap && bytestream2_get_bytes_left(&gb)) {
+        uint32_t nalu_size = 0;
+        int      nalu_type;
+
+        if (bytestream2_get_bytes_left(&gb) < s->length_size) {
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
+        for (i = 0; i < s->length_size; i++)
+            nalu_size = (nalu_size << 8) | bytestream2_get_byte(&gb);
+
+        if (nalu_size < 2 || nalu_size > bytestream2_get_bytes_left(&gb)) {
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
+
+        nalu_type = (bytestream2_peek_byte(&gb) >> 1) & 0x3f;
+        bytestream2_skip(&gb, nalu_size);
+        got_irap |= nalu_type >= HEVC_NAL_BLA_W_LP &&
+                    nalu_type <= HEVC_NAL_RSV_IRAP_VCL23;
+        got_ps   |= nalu_type >= HEVC_NAL_VPS && nalu_type <= HEVC_NAL_PPS;
+    }
+    seen_irap_ps = got_irap && got_ps;
+    got_irap = got_ps = 0;
+
+    bytestream2_init(&gb, in->data, in->size);
+
     while (bytestream2_get_bytes_left(&gb)) {
         uint32_t nalu_size = 0;
         int      nalu_type;
-        int is_irap, add_extradata, extra_size, prev_size;
+        int is_irap, is_ps, add_extradata, extra_size, prev_size;
 
         if (bytestream2_get_bytes_left(&gb) < s->length_size) {
             ret = AVERROR_INVALIDDATA;
@@ -161,9 +227,11 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
         /* prepend extradata to IRAP frames */
         is_irap = nalu_type >= HEVC_NAL_BLA_W_LP &&
                   nalu_type <= HEVC_NAL_RSV_IRAP_VCL23;
-        add_extradata = is_irap && !got_irap;
-        extra_size    = add_extradata * ctx->par_out->extradata_size;
+        is_ps   = nalu_type >= HEVC_NAL_VPS && nalu_type <= HEVC_NAL_PPS && seen_irap_ps;
+        add_extradata = (is_ps || is_irap) && !got_ps && !got_irap;
+        extra_size    = add_extradata * s->extradata_size;
         got_irap     |= is_irap;
+        got_ps       |= is_ps;
 
         if (FFMIN(INT_MAX, SIZE_MAX) < 4ULL + nalu_size + extra_size) {
             ret = AVERROR_INVALIDDATA;
@@ -177,7 +245,7 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
             goto fail;
 
         if (extra_size)
-            memcpy(out->data + prev_size, ctx->par_out->extradata, extra_size);
+            memcpy(out->data + prev_size, s->extradata, extra_size);
         AV_WB32(out->data + prev_size + extra_size, 1);
         bytestream2_get_buffer(&gb, out->data + prev_size + 4 + extra_size, nalu_size);
     }
@@ -194,6 +262,12 @@ fail:
     return ret;
 }
 
+static void hevc_mp4toannexb_close(AVBSFContext *ctx)
+{
+    HEVCBSFContext *s = ctx->priv_data;
+    av_freep(&s->extradata);
+}
+
 static const enum AVCodecID codec_ids[] = {
     AV_CODEC_ID_HEVC, AV_CODEC_ID_NONE,
 };
@@ -204,4 +278,5 @@ const FFBitStreamFilter ff_hevc_mp4toannexb_bsf = {
     .priv_data_size = sizeof(HEVCBSFContext),
     .init           = hevc_mp4toannexb_init,
     .filter         = hevc_mp4toannexb_filter,
+    .close          = hevc_mp4toannexb_close,
 };

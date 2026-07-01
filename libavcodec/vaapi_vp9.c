@@ -35,6 +35,7 @@ static VASurfaceID vaapi_vp9_surface_id(const VP9Frame *vf)
 }
 
 static int vaapi_vp9_start_frame(AVCodecContext          *avctx,
+                                 av_unused const AVBufferRef *buffer_ref,
                                  av_unused const uint8_t *buffer,
                                  av_unused uint32_t       size)
 {
@@ -158,7 +159,7 @@ static int vaapi_vp9_decode_slice(AVCodecContext *avctx,
     }
 
     err = ff_vaapi_decode_make_slice_buffer(avctx, pic,
-                                            &slice_param, sizeof(slice_param),
+                                            &slice_param, 1, sizeof(slice_param),
                                             buffer, size);
     if (err) {
         ff_vaapi_decode_cancel(avctx, pic);
